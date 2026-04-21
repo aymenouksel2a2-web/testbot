@@ -1,1 +1,2 @@
-web: python bot.py
+# Procfile
+worker: python bot.py
