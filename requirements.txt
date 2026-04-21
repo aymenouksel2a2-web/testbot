@@ -1,3 +1,1 @@
-python-telegram-bot==20.3a1  
-# Note: Use the specific version required by Railway or latest available at time of generation.
-# 20.3a1 is a common async-compatible version for Railway.
+python-telegram-bot==24.1
