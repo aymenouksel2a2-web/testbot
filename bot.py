@@ -6,6 +6,10 @@ from telebot import TeleBot, types
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 load_dotenv() # Load environment variables from .env file
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -16,21 +20,37 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 bot = TeleBot(BOT_TOKEN)
 
+# Standard Commands
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     bot.reply_to(message, "Welcome! I am your Python Telegram Bot.")
+
 
 @bot.message_handler(commands=['ping'])
 def ping_pong(message):
     bot.send_message(message.chat.id, "Pong!")
 
 
-# Arena Command with Multi-Step Screenshot Logic
-@bot.message_handler(commands=['arena'])
-def arena_command(message):
+# Dynamic Prompt Generation Command (State Management + DOM Interaction)
+@bot.message_handler(commands=['generate'])
+def generate_command(message):
     chat_id = message.chat.id
+    
+    # Step 1: Ask the user for their prompt
+    msg = bot.send_message(chat_id, "Please enter your prompt for the image:")
+    bot.register_next_step_handler(msg, process_prompt)
 
-    # Configure Chrome Options for Headless Docker environment
+
+def process_prompt(message):
+    chat_id = message.chat.id
+    user_prompt = message.text
+
+    if not user_prompt:
+        bot.send_message(chat_id, "You must provide a text description. Try again.")
+        return
+
+    
+    # Step 2: Configure Selenium and navigate to URL
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox") 
@@ -38,34 +58,42 @@ def arena_command(message):
     chrome_options.add_argument("--window-size=1920,1080")
 
     try:
-        # Initialize WebDriver (points to chromedriver installed in Docker)
         driver = webdriver.Chrome(service=ChromeService(executable_path='/usr/bin/chromedriver'), options=chrome_options)
-
-        bot.send_message(chat_id, "Initializing browser and capturing steps...")
-
-        # Navigate to URL
+        
+        # Notify user of processing time
+        bot.send_message(chat_id, "Processing your prompt... Please wait about 15 seconds.")
+        
         driver.get("https://arena.ai/image/direct")
+        
+        # Step 3: Locate the textarea using WebDriverWait and XPath
+        # We are looking for a <textarea> where placeholder contains 'Describe'
+        input_field = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.XPATH, "//textarea[contains(@placeholder, 'Describe')]"))
+        )
 
         
-        # Loop to capture 5 screenshots with 3 seconds delay between each
-        for step in range(1, 6):
-            time.sleep(3) # Wait interval
+        # Step 4: Inject the user's prompt and submit the form (simulate Enter key)
+        input_field.send_keys(user_prompt)
+        input_field.send_keys(Keys.RETURN)
 
-            # Take screenshot and save to temporary location (overwrite previous file)
-            screenshot_path = "/tmp/step.png"
-            driver.save_screenshot(screenshot_path)
+        
+        # Step 5: Wait for the image to generate (hardcoded delay)
+        time.sleep(15) # Adjust if necessary based on real site behavior
 
-            
-            # Send image to user with caption indicating progress
-            with open(screenshot_path, "rb") as photo:
-                caption = f"Step {step}/5"
-                bot.send_photo(chat_id, photo, caption=caption)
+        
+        # Step 6: Capture screenshot and send result
+        screenshot_path = "/tmp/result.png"
+        driver.save_screenshot(screenshot_path)
 
-        driver.quit() # Clean up browser instance
+        with open(screenshot_path, "rb") as photo:
+            bot.send_photo(chat_id, photo, caption="Your Result")
 
-    except Exception as e: # Catch-all for robustness in production
-        logging.error(f"Error during arena command execution: {e}")
-        bot.reply_to(message, f"An error occurred while processing the request. {e}")
+    except Exception as e:
+        logging.error(f"Error during generation process: {e}")
+        bot.reply_to(message, f"There was an error processing your prompt. {e}")
+
+    finally:
+        driver.quit() # Always clean up
 
 if __name__ == "__main__":
     bot.infinity_polling()
