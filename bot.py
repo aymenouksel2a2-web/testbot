@@ -3,16 +3,15 @@ from os import getenv
 from telegram import Update, ForceReply
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
 
-# 1. Setup Logging
+# Setup Logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# 2. Define Handlers
+# Define Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
     user = update.effective_user
     await update.message.reply_html(
         rf"Hi {user.mention_markdown_v2()}\!",
@@ -20,13 +19,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
     await update.message.reply_text('Help!')
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Echo the user message."""
     try:
-        # Simulate processing
         response = f"Received: {update.message.text}"
         if len(response) > 4096:
             raise ValueError("Message too long")
@@ -36,15 +32,11 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("An error occurred while processing your request.")
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle unknown commands."""
     await update.message.reply_text(
         "Sorry, I didn't understand that command."
     )
 
-# 3. Main Function (Entry Point)
 def main() -> None:
-    """Start the bot."""
-    # Retrieve token from environment variables securely
     telegram_token = getenv('TELEGRAM_TOKEN')
     
     if not telegram_token:
