@@ -1,60 +1,32 @@
+# bot.py
+import os
 import logging
-from os import getenv
-from telegram import Update, ForceReply
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from dotenv import load_dotenv
+import telebot
 
-# Setup Logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+load_dotenv() # Load environment variables from .env file
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Define Handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    await update.message.reply_html(
-        rf"Hi {user.mention_markdown_v2()}\!",
-        reply_markup=ForceReply(selective=True),
-    )
+if not BOT_TOKEN:
+    raise ValueError("Bot token is missing. Ensure you have a '.env' file with 'BOT_TOKEN='.")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('Help!')
+logging.basicConfig(level=logging.INFO)
+bot = telebot.TeleBot(BOT_TOKEN)
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        response = f"Received: {update.message.text}"
-        if len(response) > 4096:
-            raise ValueError("Message too long")
-        await update.message.reply_text(response)
-    except Exception as e:
-        logger.error(f"Error in echo handler: {e}")
-        await update.message.reply_text("An error occurred while processing your request.")
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "Welcome! I am your Python Telegram Bot.")
 
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Sorry, I didn't understand that command."
-    )
+@bot.message_handler(commands=['ping'])
+def ping_pong(message):
+    bot.send_message(message.chat.id, "Pong!")
 
-def main() -> None:
-    telegram_token = getenv('TELEGRAM_TOKEN')
-    
-    if not telegram_token:
-        logger.critical("Telegram Token is missing!")
-        return
 
-    application = ApplicationBuilder().token(telegram_token).build()
+# Fallback handler for all text messages
+@bot.message_handler(func=lambda message: True)
+def echo_all(message):
+    if message.text:
+        bot.reply_to(message, f"You said: {message.text}")
 
-    # Add Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-
-    # Handle unknown commands/errors
-    application.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-    # Start polling
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    bot.infinity_polling()
