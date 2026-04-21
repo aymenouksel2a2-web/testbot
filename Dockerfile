@@ -7,8 +7,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
-# Install system dependencies.
-# Replaced 'chromium-chromedriver' with 'chromium' and 'chromium-driver' for modern Debian compatibility.
+# Install system dependencies required by Chromium in headless mode.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         chromium \
@@ -19,9 +18,11 @@ RUN apt-get update && \
         gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Copy requirements file first to leverage Docker cache
 COPY requirements.txt .
-RUN pip install --no-cache-dir .
+
+# FIX: Use '-r' to read from the file instead of '.' which looks for setup.py
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the bot application code into the container
 COPY . .
