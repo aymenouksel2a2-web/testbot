@@ -1,12 +1,11 @@
-# bot.py
 import os
 import logging
+import time
 from dotenv import load_dotenv
 from telebot import TeleBot, types
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import WebDriverException
 
 load_dotenv() # Load environment variables from .env file
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -17,22 +16,20 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 bot = TeleBot(BOT_TOKEN)
 
-# Standard Commands
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     bot.reply_to(message, "Welcome! I am your Python Telegram Bot.")
-
 
 @bot.message_handler(commands=['ping'])
 def ping_pong(message):
     bot.send_message(message.chat.id, "Pong!")
 
 
-# Arena Command (Selenium Integration)
+# Arena Command with Multi-Step Screenshot Logic
 @bot.message_handler(commands=['arena'])
 def arena_command(message):
     chat_id = message.chat.id
-    
+
     # Configure Chrome Options for Headless Docker environment
     chrome_options = Options()
     chrome_options.add_argument("--headless")
@@ -44,26 +41,31 @@ def arena_command(message):
         # Initialize WebDriver (points to chromedriver installed in Docker)
         driver = webdriver.Chrome(service=ChromeService(executable_path='/usr/bin/chromedriver'), options=chrome_options)
 
-        bot.send_message(chat_id, "Initializing browser...")
-        
+        bot.send_message(chat_id, "Initializing browser and capturing steps...")
+
         # Navigate to URL
         driver.get("https://arena.ai/image/direct")
+
         
-        # Take screenshot (wait for page to load)
-        screenshot = driver.get_screenshot_as_file("/tmp/screenshot.png")
+        # Loop to capture 5 screenshots with 3 seconds delay between each
+        for step in range(1, 6):
+            time.sleep(3) # Wait interval
 
-        if not screenshot:
-            raise Exception("Screenshot generation failed.")
+            # Take screenshot and save to temporary location (overwrite previous file)
+            screenshot_path = "/tmp/step.png"
+            driver.save_screenshot(screenshot_path)
 
-        driver.quit() # Crucial: Clean up browser instance to free Docker container memory
-
-        # Send image to Telegram
-        with open("/tmp/screenshot.png", "rb") as photo:
-            bot.send_photo(chat_id, photo)
             
-    except WebDriverException as e:
-        logging.error(f"Selenium error occurred: {e}")
-        bot.reply_to(message, f"Error navigating to the site. {e}")
+            # Send image to user with caption indicating progress
+            with open(screenshot_path, "rb") as photo:
+                caption = f"Step {step}/5"
+                bot.send_photo(chat_id, photo, caption=caption)
+
+        driver.quit() # Clean up browser instance
+
+    except Exception as e: # Catch-all for robustness in production
+        logging.error(f"Error during arena command execution: {e}")
+        bot.reply_to(message, f"An error occurred while processing the request. {e}")
 
 if __name__ == "__main__":
     bot.infinity_polling()
