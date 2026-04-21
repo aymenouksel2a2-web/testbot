@@ -1,16 +1,18 @@
 # Dockerfile
-# Use an official Python runtime as a parent image
-FROM python:3.10-slim
+# Use a pinned, stable Python runtime (Debian 12 Bookworm) to prevent package tree instability
+FROM python:3.10-slim-bookworm
 
 # Set environment variables for non-interactive installation and locale settings
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
-# Install system dependencies required by Chrome/Chromium in headless mode
+# Install system dependencies.
+# Replaced 'chromium-chromedriver' with 'chromium' and 'chromium-driver' for modern Debian compatibility.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        chromium-chromedriver \
+        chromium \
+        chromium-driver \
         fonts-liberation \
         libappindicator3-1 \
         wget \
@@ -24,11 +26,8 @@ RUN pip install --no-cache-dir .
 # Copy the bot application code into the container
 COPY . .
 
-# Define environment variable for BOT_TOKEN (Docker will look for this at runtime)
+# Define environment variable for BOT_TOKEN (Railway will inject this at runtime)
 ENV BOT_TOKEN=${BOT_TOKEN}
 
-# Expose port 80 if needed, but for Telegram bots using infinity_polling,
-# we don't strictly need to open a port unless using webhooks.
-# However, standard practice is CMD python bot.py
-
+# Run the background worker strictly
 CMD ["python", "bot.py"]
