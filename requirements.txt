@@ -1,1 +1,1 @@
-python-telegram-bot==20.3a1   # Ensure this version exists or use latest available like 24.0 if it works in your specific year context, but 20.x is safest for async compatibility check. Let's stick to 20.3 as per original safe bet.
+python-telegram-bot==22.7
