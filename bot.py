@@ -49,12 +49,15 @@ def process_prompt(message):
         return
 
     
-    # Step 2: Configure Selenium and navigate to URL
+    # Step 2: Configure Selenium with Anti-Bot headers and options
     chrome_options = Options()
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox") 
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
+
+    # Spoof User-Agent to mimic a real Windows Chrome user
+    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
     try:
         driver = webdriver.Chrome(service=ChromeService(executable_path='/usr/bin/chromedriver'), options=chrome_options)
@@ -65,25 +68,31 @@ def process_prompt(message):
         
         driver.get("https://arena.ai/image/direct")
         
-        # Step 3: Modal Bypass Logic (Click Agree)
-        # Wait for the 'Agree' button to be clickable and click it
-        agree_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Agree')]"))
-        )
-        agree_button.click()
-        
-        # Ensure modal animation finishes before proceeding (DOM settling)
-        time.sleep(1)    
-
+        # Step 3: Modal Bypass Logic (JS Injection)
+        try:
+            # Wait for the 'Agree' button to be present and clickable within 5s
+            agree_button = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Agree')]"))
+            )
+            
+            # Instead of standard .click() which fails in headless mode,
+            # inject JS to force the click immediately.    
+            driver.execute_script("arguments[0].click();", agree_button)
+        except Exception as e:
+            # If modal not found, just pass silently (don't crash)    
+            logging.info(f"No Agree button found. Modal likely already accepted or missing. {e}")
+            
         
         # Step 4: Locate the textarea using WebDriverWait and XPath
         input_field = WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.XPATH, "//textarea[contains(@placeholder, 'Describe')]"))
         )
         
-        # Step 5: Inject user prompt and submit form
-        input_field.send_keys(user_prompt)
-        input_field.send_keys(Keys.RETURN)
+        # Step 5: Clear field, inject user prompt and submit form via JS for reliability
+        driver.execute_script("arguments[0].value = ''; arguments[0].focus();", input_field)
+        input_field.send_keys(user_prompt)    
+        input_field.send_keys(Keys.RETURN)    
+
         
         # Step 6: Wait for image generation (Hardcoded delay)
         time.sleep(15)    
@@ -96,8 +105,10 @@ def process_prompt(message):
             bot.send_photo(chat_id, photo, caption="Your Result")
 
     except Exception as e:
-        logging.error(f"Error during generation process: {e}")
-        bot.reply_to(message, f"There was an error processing your prompt. {e}")
+        # Catch-all exception handler for defensive programming    
+        error_msg = str(e).split('\n')[0] # Get first line of error only    
+        logging.error(f"Error during generation process: {error_msg}")
+        bot.reply_to(message, f"There was an error processing your prompt. {error_msg}")
 
     finally:
         driver.quit() # Always clean up
