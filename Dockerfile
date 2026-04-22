@@ -1,34 +1,17 @@
-# Dockerfile
-# Use a pinned, stable Python runtime (Debian 12 Bookworm) to prevent package tree instability
-FROM python:3.10-slim-bookworm
+FROM python:3.11-slim
 
-# Set environment variables for non-interactive installation and locale settings
-ENV DEBIAN_FRONTEND=noninteractive \
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+# إعداد مسار العمل داخل الحاوية
+WORKDIR /app
 
-# Install system dependencies required by Chromium in headless mode.
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        chromium \
-        chromium-driver \
-        fonts-liberation \
-        libappindicator3-1 \
-        wget \
-        gnupg \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements file first to leverage Docker cache
+# نسخ وتثبيت المكتبات
 COPY requirements.txt .
-
-# FIX: Use '-r' to read from the file instead of '.' which looks for setup.py
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the bot application code into the container
+# تثبيت متصفح Chromium مع كافة اعتماديته داخل نظام Linux
+RUN playwright install --with-deps chromium
+
+# نسخ باقي الكود
 COPY . .
 
-# Define environment variable for BOT_TOKEN (Railway will inject this at runtime)
-ENV BOT_TOKEN=${BOT_TOKEN}
-
-# Run the background worker strictly
+# أمر التشغيل
 CMD ["python", "bot.py"]
