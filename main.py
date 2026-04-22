@@ -1,6 +1,5 @@
 import telebot
 import os
-import time
 import threading
 from playwright.sync_api import sync_playwright
 import re
@@ -13,22 +12,16 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# قاموس لتتبع العمليات النشطة
+# قاموس لتتبع العمليات النشطة لمنع تداخل الطلبات
 active_tasks = {}
 
 # دالة للتحقق من صحة الرابط
 def is_valid_url(url):
-    regex = re.compile(
-        r'^(?:http|ftp)s?://'
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'
-        r'localhost|'
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-        r'(?::\d+)?'
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    regex = re.compile(r'^(?:http|ftp)s?://', re.IGNORECASE)
     return re.match(regex, url) is not None
 
-# الدالة المسؤولة عن فتح المتصفح واستخراج النصوص والصور
-def extract_content(chat_id, url):
+# الدالة المسؤولة عن الدخول واستخراج وقت اللاب تحديداً
+def extract_lab_time(chat_id, url):
     active_tasks[chat_id] = True
     
     try:
@@ -40,38 +33,44 @@ def extract_content(chat_id, url):
             # تعيين أبعاد الشاشة
             page.set_viewport_size({"width": 1280, "height": 720})
             
-            bot.send_message(chat_id, "⏳ جاري فتح الرابط واستخراج النصوص (قد يستغرق بضع ثواني لضمان تحميل كل شيء)...")
+            bot.send_message(chat_id, "⏳ جاري الدخول للصفحة والبحث عن وقت اللاب (Time limit)...")
             
-            # الدخول للرابط والانتظار حتى يكتمل تحميل كل السكريبتات الديناميكية (networkidle)
-            page.goto(url, timeout=60000, wait_until="networkidle") 
-            # زيادة وقت الانتظار قليلاً لضمان عمل العدادات وظهور الوقت المتبقي
-            time.sleep(5) 
+            # الدخول للرابط
+            page.goto(url, timeout=60000) 
             
-            # 1. التقاط لقطة شاشة واحدة
+            # نمط البحث (Regex) الذي يمثل شكل العداد، مثلاً: 03:00:00 أو 1:30:00
+            time_regex = r"\d{1,2}:\d{2}:\d{2}"
+            
+            # توجيه Playwright للبحث عن أي عنصر في الصفحة يطابق شكل الوقت
+            # هذه الطريقة تخترق الـ Shadow DOM الذي تستخدمه منصة Google Skills
+            time_locator = page.locator(f"text=/{time_regex}/").first
+            
+            lab_time = None
+            try:
+                # انتظار ظهور الوقت على الشاشة لمدة أقصاها 20 ثانية لضمان اكتمال السكريبتات
+                time_locator.wait_for(timeout=20000)
+                # سحب النص المكتشف
+                full_text = time_locator.inner_text()
+                # استخلاص الأرقام (الوقت) بدقة من النص المكتشف
+                match = re.search(time_regex, full_text)
+                if match:
+                    lab_time = match.group(0)
+            except Exception as wait_err:
+                pass # في حال لم يجده خلال 20 ثانية
+            
+            # التقاط صورة للصفحة كمرجع
             screenshot_bytes = page.screenshot(full_page=False)
             bot.send_photo(chat_id, screenshot_bytes, caption="📸 لقطة شاشة للصفحة")
             
-            # 2. استخراج جميع النصوص الموجودة في وسم Body
-            text_content = page.locator("body").inner_text()
-            
-            # إرسال النصوص
-            if not text_content or not text_content.strip():
-                bot.send_message(chat_id, "⚠️ لم أتمكن من العثور على نصوص واضحة في هذه الصفحة.")
+            # إرسال النتيجة المستخرجة
+            if lab_time:
+                bot.send_message(chat_id, f"✅ **وقت اللاب المستخرج:**\n\n⏱️ `{lab_time}`", parse_mode="Markdown")
             else:
-                bot.send_message(chat_id, "📄 **النصوص المستخرجة من الصفحة:**", parse_mode="Markdown")
-                
-                # تقسيم النص وإرساله على دفعات (تيليجرام يمنع الرسائل أطول من 4096 حرف)
-                max_length = 4000
-                for i in range(0, len(text_content), max_length):
-                    chunk = text_content[i:i+max_length]
-                    bot.send_message(chat_id, f"```\n{chunk}\n```", parse_mode="Markdown")
-                    time.sleep(0.5) # فاصل زمني بسيط لتجنب حظر الإرسال من تيليجرام
+                bot.send_message(chat_id, "⚠️ لم أتمكن من العثور على وقت اللاب في الصفحة. تأكد من أن العداد يظهر دون الحاجة لتسجيل دخول إضافي.")
             
             browser.close()
-            bot.send_message(chat_id, "✅ اكتملت المهمة!")
                 
     except Exception as e:
-        # تقصير رسالة الخطأ
         error_msg = str(e)[:1000]
         bot.send_message(chat_id, f"❌ حدث خطأ أثناء فتح الرابط:\n{error_msg}")
     finally:
@@ -83,7 +82,7 @@ def extract_content(chat_id, url):
 def send_welcome(message):
     welcome_text = (
         "مرحباً! 🤖\n\n"
-        "أرسل لي أي رابط (URL) وسأقوم بالدخول إليه واستخراج **جميع النصوص** الموجودة فيه مع لقطة شاشة.\n"
+        "أرسل لي رابط اللاب (Google Skills) وسأقوم باستخراج **وقت اللاب المخصص (Time limit)** فقط وإرساله لك مع لقطة شاشة.\n"
     )
     bot.reply_to(message, welcome_text)
 
@@ -98,8 +97,8 @@ def handle_message(message):
             bot.reply_to(message, "⚠️ أنا أقوم بمعالجة رابط حالياً، انتظر حتى أنتهي من فضلك.")
             return
         
-        # تشغيل المتصفح في مسار منفصل (Thread)
-        thread = threading.Thread(target=extract_content, args=(chat_id, text))
+        # تشغيل العملية في مسار منفصل (Thread)
+        thread = threading.Thread(target=extract_lab_time, args=(chat_id, text))
         thread.start()
     else:
         bot.reply_to(message, "عذراً، هذا ليس رابطاً صحيحاً. يرجى إرسال رابط يبدأ بـ http:// أو https://")
