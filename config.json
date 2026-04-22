@@ -13,7 +13,10 @@
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "tcp"
+        "network": "ws",
+        "wsSettings": {
+          "path": "/aynx-tunnel"
+        }
       }
     }
   ],
