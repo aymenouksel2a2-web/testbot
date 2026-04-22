@@ -8,54 +8,57 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "مرحباً! أرسل أمر /get_time لجلب الوقت من موقع Google Skills.")
+    bot.reply_to(message, "مرحباً! أرسل أمر /get_time لجلب الوقت.")
 
 @bot.message_handler(commands=['get_time'])
 def fetch_lab_time(message):
     url = "https://www.skills.google/focuses/19146?parent=catalog"
     
-    msg = bot.reply_to(message, "⏳ جاري تشغيل المتصفح وتحليل الصفحة (قد يستغرق بضع ثوانٍ)...")
+    msg = bot.reply_to(message, "⏳ جاري الاتصال بالموقع (بالنسخة السريعة)...")
     
     try:
         with sync_playwright() as p:
-            # إضافة إعدادات ضرورية جداً لمنع انهيار المتصفح في خوادم Railway
+            # تشغيل المتصفح بأقصى إعدادات توفير الذاكرة
             browser = p.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-gpu"
+                    "--disable-gpu",
+                    "--single-process"
                 ]
             )
-            page = browser.new_page()
             
-            # تغيير طريقة الانتظار لكي لا يعلق البوت بسبب سكريبتات جوجل
-            # مع وضع حد أقصى للوقت (60 ثانية)
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            context = browser.new_context()
             
-            # إجبار المتصفح على الانتظار 3 ثوانٍ إضافية لضمان عمل جافا سكريبت وظهور الوقت
-            page.wait_for_timeout(3000)
+            # منع تحميل الصور والملفات الثقيلة لتسريع العملية
+            context.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font", "stylesheet"] else route.continue_())
             
-            # سحب النص الظاهر للمستخدم
+            page = context.new_page()
+            
+            # أقصى مدة للانتظار 30 ثانية حتى لا يعلق البوت للأبد
+            page.set_default_timeout(30000) 
+            
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500) # انتظار 2.5 ثانية ليظهر الوقت عبر جافا سكريبت
+            
             page_text = page.inner_text("body")
-            
-            # البحث عن نمط الوقت باستخدام Regex
             time_pattern = re.search(r'\d{2}:\d{2}:\d{2}', page_text)
             
             if time_pattern:
                 extracted_time = time_pattern.group(0)
                 bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, 
-                                      text=f"✅ تم العثور على الوقت بنجاح!\n\n⏱️ الوقت المخصص للمختبر هو: **{extracted_time}**", parse_mode="Markdown")
+                                      text=f"✅ تم العثور على الوقت بنجاح!\n\n⏱️ الوقت: **{extracted_time}**", parse_mode="Markdown")
             else:
                 bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, 
-                                      text="❌ لم أتمكن من العثور على الوقت. قد يكون الموقع قام بتغيير هيكله أو يتطلب تسجيل دخول.")
+                                      text="❌ اكتمل التحميل ولكن لم يتم العثور على الوقت في الصفحة.")
             
             browser.close()
             
     except Exception as e:
-        # الآن إذا حدث خطأ سيتم طباعته بدلاً من التعليق
+        # الآن إذا حدث أي خطأ سيظهر لك في رسالة واضحة
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, 
-                              text=f"⚠️ حدث خطأ أثناء تشغيل المتصفح: {e}")
+                              text=f"⚠️ حدث خطأ: {str(e)}")
 
-print("Bot is running with Playwright (Optimized for Railway)...")
+print("Bot is running securely with Docker...")
 bot.infinity_polling()
