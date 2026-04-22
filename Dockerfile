@@ -1,17 +1,20 @@
-FROM python:3.11-slim
+# استخدام نظام تشغيل مصغر لتقليل حجم الحاوية (حوالي 5 ميجابايت)
+FROM alpine:latest
 
-# إعداد مسار العمل داخل الحاوية
-WORKDIR /app
+# تثبيت الحزم والأدوات اللازمة لمعالجة النصوص والشبكة
+RUN apk add --no-cache unzip wget curl jq
 
-# نسخ وتثبيت المكتبات
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# إنشاء مسارات العمل
+WORKDIR /etc/xray
 
-# تثبيت متصفح Chromium مع كافة اعتماديته داخل نظام Linux
-RUN playwright install --with-deps chromium
+# تحميل نواة Xray واستخراجها في مسار النظام
+RUN wget -O xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip \
+    && unzip xray.zip -d /usr/local/bin/ \
+    && rm xray.zip \
+    && chmod +x /usr/local/bin/xray
 
-# نسخ باقي الكود
-COPY . .
+# استيراد ملف الإعدادات الخاص بك
+COPY config.json /etc/xray/config.json
 
-# أمر التشغيل
-CMD ["python", "bot.py"]
+# الأمر الحرج: قراءة ملف الإعداد، استبدال المنفذ بالمنفذ الممنوح من بيئة Railway، ثم تشغيل النواة
+CMD jq ".inbounds[0].port = ${PORT}" /etc/xray/config.json > /tmp/config.json && /usr/local/bin/xray -config /tmp/config.json
