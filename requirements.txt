@@ -1,2 +1,2 @@
 pyTelegramBotAPI
-playwright
+playwright==1.42.0
