@@ -40,11 +40,12 @@ def extract_content(chat_id, url):
             # تعيين أبعاد الشاشة
             page.set_viewport_size({"width": 1280, "height": 720})
             
-            bot.send_message(chat_id, "⏳ جاري فتح الرابط واستخراج النصوص...")
+            bot.send_message(chat_id, "⏳ جاري فتح الرابط واستخراج النصوص (قد يستغرق بضع ثواني لضمان تحميل كل شيء)...")
             
-            # الدخول للرابط والانتظار قليلاً حتى يتم تحميل المحتوى الديناميكي (مثل JavaScript)
-            page.goto(url, timeout=60000) 
-            time.sleep(3) 
+            # الدخول للرابط والانتظار حتى يكتمل تحميل كل السكريبتات الديناميكية (networkidle)
+            page.goto(url, timeout=60000, wait_until="networkidle") 
+            # زيادة وقت الانتظار قليلاً لضمان عمل العدادات وظهور الوقت المتبقي
+            time.sleep(5) 
             
             # 1. التقاط لقطة شاشة واحدة
             screenshot_bytes = page.screenshot(full_page=False)
