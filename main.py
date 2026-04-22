@@ -13,7 +13,7 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# قاموس لتتبع عمليات التصوير النشطة (لتتمكن من إيقافها)
+# قاموس لتتبع العمليات النشطة
 active_tasks = {}
 
 # دالة للتحقق من صحة الرابط
@@ -27,8 +27,8 @@ def is_valid_url(url):
         r'(?:/?|[/?]\S+)$', re.IGNORECASE)
     return re.match(regex, url) is not None
 
-# الدالة المسؤولة عن فتح المتصفح والتقاط الصور
-def take_screenshots(chat_id, url):
+# الدالة المسؤولة عن فتح المتصفح واستخراج النصوص والصور
+def extract_content(chat_id, url):
     active_tasks[chat_id] = True
     
     try:
@@ -40,26 +40,37 @@ def take_screenshots(chat_id, url):
             # تعيين أبعاد الشاشة
             page.set_viewport_size({"width": 1280, "height": 720})
             
-            bot.send_message(chat_id, "⏳ جاري فتح الرابط وبدء التقاط الشاشة كل 3 ثواني...\n(أرسل /stop في أي وقت للإيقاف)")
-            page.goto(url, timeout=60000) # مهلة 60 ثانية لفتح الموقع
+            bot.send_message(chat_id, "⏳ جاري فتح الرابط واستخراج النصوص...")
             
-            # التقاط 20 صورة كحد أقصى (دقيقة كاملة) كإجراء أمان لمنع التحميل الزائد
-            count = 0
-            while active_tasks.get(chat_id) and count < 20:
-                screenshot_bytes = page.screenshot(full_page=False)
-                bot.send_photo(chat_id, screenshot_bytes, caption=f"لقطة شاشة رقم {count+1}")
-                time.sleep(3) # الانتظار 3 ثواني
-                count += 1
+            # الدخول للرابط والانتظار قليلاً حتى يتم تحميل المحتوى الديناميكي (مثل JavaScript)
+            page.goto(url, timeout=60000) 
+            time.sleep(3) 
+            
+            # 1. التقاط لقطة شاشة واحدة
+            screenshot_bytes = page.screenshot(full_page=False)
+            bot.send_photo(chat_id, screenshot_bytes, caption="📸 لقطة شاشة للصفحة")
+            
+            # 2. استخراج جميع النصوص الموجودة في وسم Body
+            text_content = page.locator("body").inner_text()
+            
+            # إرسال النصوص
+            if not text_content or not text_content.strip():
+                bot.send_message(chat_id, "⚠️ لم أتمكن من العثور على نصوص واضحة في هذه الصفحة.")
+            else:
+                bot.send_message(chat_id, "📄 **النصوص المستخرجة من الصفحة:**", parse_mode="Markdown")
+                
+                # تقسيم النص وإرساله على دفعات (تيليجرام يمنع الرسائل أطول من 4096 حرف)
+                max_length = 4000
+                for i in range(0, len(text_content), max_length):
+                    chunk = text_content[i:i+max_length]
+                    bot.send_message(chat_id, f"```\n{chunk}\n```", parse_mode="Markdown")
+                    time.sleep(0.5) # فاصل زمني بسيط لتجنب حظر الإرسال من تيليجرام
             
             browser.close()
-            
-            if count >= 20:
-                bot.send_message(chat_id, "✅ تم التقاط 20 صورة (تم التوقف تلقائياً لحماية الخادم).")
-            else:
-                bot.send_message(chat_id, "🛑 تم إيقاف التقاط الشاشة بنجاح.")
+            bot.send_message(chat_id, "✅ اكتملت المهمة!")
                 
     except Exception as e:
-        # تقصير رسالة الخطأ لتجنب حظر الإرسال من تيليجرام (حد 4096 حرف)
+        # تقصير رسالة الخطأ
         error_msg = str(e)[:1000]
         bot.send_message(chat_id, f"❌ حدث خطأ أثناء فتح الرابط:\n{error_msg}")
     finally:
@@ -69,17 +80,11 @@ def take_screenshots(chat_id, url):
 # الرد على أمر البدء
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "مرحباً! 📸\nأرسل لي أي رابط (URL) وسأقوم بالدخول إليه وإرسال لقطة شاشة كل 3 ثواني.\n\nلإيقاف العملية في أي وقت، أرسل الأمر /stop")
-
-# أمر الإيقاف
-@bot.message_handler(commands=['stop'])
-def stop_screenshotting(message):
-    chat_id = message.chat.id
-    if chat_id in active_tasks:
-        active_tasks[chat_id] = False
-        bot.reply_to(message, "⏳ جاري إيقاف عملية التقاط الشاشة...")
-    else:
-        bot.reply_to(message, "لا توجد أي عملية التقاط شاشة نشطة حالياً.")
+    welcome_text = (
+        "مرحباً! 🤖\n\n"
+        "أرسل لي أي رابط (URL) وسأقوم بالدخول إليه واستخراج **جميع النصوص** الموجودة فيه مع لقطة شاشة.\n"
+    )
+    bot.reply_to(message, welcome_text)
 
 # الرد على الروابط
 @bot.message_handler(func=lambda message: True)
@@ -89,11 +94,11 @@ def handle_message(message):
     
     if is_valid_url(text):
         if chat_id in active_tasks:
-            bot.reply_to(message, "⚠️ الرجاء إيقاف العملية الحالية أولاً باستخدام /stop قبل إرسال رابط جديد.")
+            bot.reply_to(message, "⚠️ أنا أقوم بمعالجة رابط حالياً، انتظر حتى أنتهي من فضلك.")
             return
         
-        # تشغيل المتصفح في مسار منفصل (Thread) حتى لا يتعطل البوت عن استقبال الأوامر
-        thread = threading.Thread(target=take_screenshots, args=(chat_id, text))
+        # تشغيل المتصفح في مسار منفصل (Thread)
+        thread = threading.Thread(target=extract_content, args=(chat_id, text))
         thread.start()
     else:
         bot.reply_to(message, "عذراً، هذا ليس رابطاً صحيحاً. يرجى إرسال رابط يبدأ بـ http:// أو https://")
