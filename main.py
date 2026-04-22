@@ -1,5 +1,6 @@
 import telebot
 import os
+import time
 import threading
 from playwright.sync_api import sync_playwright
 import re
@@ -33,30 +34,31 @@ def extract_lab_time(chat_id, url):
             # تعيين أبعاد الشاشة
             page.set_viewport_size({"width": 1280, "height": 720})
             
-            bot.send_message(chat_id, "⏳ جاري الدخول للصفحة والبحث عن وقت اللاب (Time limit)...")
+            bot.send_message(chat_id, "⏳ جاري الدخول للصفحة والبحث عن وقت اللاب الحقيقي...")
             
-            # الدخول للرابط
-            page.goto(url, timeout=60000) 
+            # الدخول للرابط والانتظار حتى اكتمال تحميل الشبكة لتجنب أخذ نصوص غير مكتملة
+            page.goto(url, timeout=60000, wait_until="networkidle") 
+            time.sleep(3) # إعطاء مهلة إضافية ليظهر العداد الفعلي
             
-            # نمط البحث (Regex) الذي يمثل شكل العداد، مثلاً: 03:00:00 أو 1:30:00
-            time_regex = r"\d{1,2}:\d{2}:\d{2}"
-            
-            # توجيه Playwright للبحث عن أي عنصر في الصفحة يطابق شكل الوقت
-            # هذه الطريقة تخترق الـ Shadow DOM الذي تستخدمه منصة Google Skills
-            time_locator = page.locator(f"text=/{time_regex}/").first
+            # نمط البحث (Regex): تم إجبار البحث على 6 أرقام بالضبط (مثال 03:00:00) 
+            # هذا يمنع البوت من قراءة النص "1:15:00" الموجود كـ(مثال) داخل تعليمات اللاب.
+            time_regex = r"\d{2}:\d{2}:\d{2}"
             
             lab_time = None
-            try:
-                # انتظار ظهور الوقت على الشاشة لمدة أقصاها 20 ثانية لضمان اكتمال السكريبتات
-                time_locator.wait_for(timeout=20000)
-                # سحب النص المكتشف
-                full_text = time_locator.inner_text()
-                # استخلاص الأرقام (الوقت) بدقة من النص المكتشف
-                match = re.search(time_regex, full_text)
-                if match:
-                    lab_time = match.group(0)
-            except Exception as wait_err:
-                pass # في حال لم يجده خلال 20 ثانية
+            
+            # استخراج النص الكامل للصفحة للبحث فيه بدقة
+            full_page_text = page.locator("body").inner_text()
+            
+            # 1. نبحث أولاً عن الوقت المرتبط مباشرة بكلمة Time limit لضمان الدقة القصوى
+            match_exact = re.search(r"(\d{2}:\d{2}:\d{2})\s*(?:\n\s*)?(?:\?|Time limit)", full_page_text, re.IGNORECASE)
+            
+            if match_exact:
+                lab_time = match_exact.group(1)
+            else:
+                # 2. في حال لم يجده بالشكل السابق، يبحث عن أي عداد بـ 6 أرقام (03:00:00)
+                fallback_match = re.search(time_regex, full_page_text)
+                if fallback_match:
+                    lab_time = fallback_match.group(0)
             
             # التقاط صورة للصفحة كمرجع
             screenshot_bytes = page.screenshot(full_page=False)
