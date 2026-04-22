@@ -59,7 +59,9 @@ def take_screenshots(chat_id, url):
                 bot.send_message(chat_id, "🛑 تم إيقاف التقاط الشاشة بنجاح.")
                 
     except Exception as e:
-        bot.send_message(chat_id, f"❌ حدث خطأ أثناء فتح الرابط:\n{str(e)}")
+        # تقصير رسالة الخطأ لتجنب حظر الإرسال من تيليجرام (حد 4096 حرف)
+        error_msg = str(e)[:1000]
+        bot.send_message(chat_id, f"❌ حدث خطأ أثناء فتح الرابط:\n{error_msg}")
     finally:
         if chat_id in active_tasks:
             del active_tasks[chat_id]
