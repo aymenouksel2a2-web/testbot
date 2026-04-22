@@ -2,177 +2,197 @@ import os
 import re
 import time
 import json
+import io
 import telebot
 import pytesseract
-from PIL import Image, ImageFilter
+from PIL import Image, ImageOps
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+# --- إعدادات ---
 TOKEN = os.environ.get("BOT_TOKEN")
 COOKIES_STR = os.environ.get("COOKIES_JSON")
 
+# تحديد مسار tesseract صراحة ليعمل في Docker
+pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
+
 bot = telebot.TeleBot(TOKEN)
 
-def setup_driver():
+def get_driver():
     options = Options()
-    options.add_argument("--headless=new") # وضع جديد أفضل
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=en-US")
-    # إخفاء الأتمتة
+    
+    # إخفاء علامات الأتمتة ليبدو كإنسان
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
     
     driver = webdriver.Chrome(options=options)
+    # إخفاء خاصية webdriver في JavaScript
+    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+        'source': '''
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = {runtime: {}};
+        '''
+    })
     return driver
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "👋 أهلاً! أرسل /time وسألتقط لك الوقت الحقيقي.")
-
 @bot.message_handler(commands=['time'])
-def get_time(message):
-    msg = bot.reply_to(message, "⏳ جاري الاتصال... قد تستغرق العملية 15 ثانية...")
+def get_lab_time(message):
+    status_msg = bot.reply_to(message, "🔄 جاري الاتصال... انتظر (15 ثانية)")
     driver = None
     
     try:
-        driver = setup_driver()
+        driver = get_driver()
         
-        # 1. تحميل الكوكيز
+        # --- الخطوة 1: الدخول بكوكيزك ---
+        print("[1] جاري تحميل الكوكيز...")
         driver.get("https://www.google.com")
-        time.sleep(3)
+        time.sleep(4) # انتظار طويل
         
+        cookies_loaded = 0
         if COOKIES_STR:
             try:
-                cookies = json.loads(COOKIES_STR)
-                for c in cookies:
+                cookies_list = json.loads(COOKIES_STR)
+                for c in cookies_list:
                     try:
+                        # تنظيف البيانات المزعجة
                         c.pop('sameSite', None)
                         c.pop('httpOnly', None)
                         c.pop('hostOnly', None)
                         driver.add_cookie(c)
-                    except:
-                        pass
+                        cookies_loaded += 1
+                    except Exception as e:
+                        continue
+                print(f"[OK] تم تحميل {cookies_loaded} كوكيز")
             except Exception as e:
-                print(f"Cookie Error: {e}")
-
-        # 2. الدخول للصفحة المستهدفة
+                print(f"[ERR] فشل قراءة JSON: {e}")
+        
+        # --- الخطوة 2: فتح الصفحة المستهدفة ---
         target_url = "https://www.skills.google/focuses/19146?parent=catalog"
+        print("[2] فتح الرابط...")
         driver.get(target_url)
         
-        # 3. الانتظار الطويل (لأن جوجل بطيء في تحميل الـ JS الخاص بالمؤقت)
-        print("جاري تحميل الصفحة...")
-        time.sleep(12) 
+        # الانتظار الطويل جداً (جوجل تحتاج وقت)
+        print("[3] انتظار تحميل الصفحة...")
+        time.sleep(15) 
         
-        # محاولة إزالة نوافذ المنبثقة (Popups) إن وجدت
+        # محاولة إغلاق نوافذ الـ Popups (OK / Accept)
         try:
-            # إغلاق نافذة Cookies إن ظهرت
-            close_btns = driver.find_elements(By.XPATH, "//button[contains(text(), 'OK') or contains(text(), 'Got it') or contains(text(), 'Accept')]")
-            for btn in close_btns[:2]:
-                try:
-                    btn.click()
-                    time.sleep(1)
-                except:
-                    pass
-        except:
-            pass
-        
-        # ---------------------------------------------------
-        # الطريقة الأولى: البحث في كود HTML (Regex) - سريعة
-        # ---------------------------------------------------
-        found_time = None
-        try:
-            html = driver.page_source
-            # نمط البحث: XX:XX:XX حيث X أرقام
-            match = re.search(r'(\d{2}:\d{2}:\d{2})', html)
-            if match:
-                found_time = match.group(1)
-                print(f"وجدت وقت في HTML: {found_time}")
+            wait = WebDriverWait(driver, 5)
+            popup_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Got it') or contains(text(), 'OK')]")))
+            popup_btn.click()
+            time.sleep(2)
         except:
             pass
             
-        # ---------------------------------------------------
-        # الطريقة الثانية: OCR (قراءة الصورة) - ضمان 100%
-        # ---------------------------------------------------
-        if not found_time or found_time == "00:00:00":
-            print("لم أجد وقت في HTML، سأستخدم OCR على الصورة...")
-            
-            # التقاط الصورة بدقة عالية
-            screenshot_path = "ss_raw.png"
-            crop_path = "ss_crop.png"
-            driver.save_screenshot(screenshot_path)
-            
-            # فتح الصورة وتحويلها للأفضلية
-            img = Image.open(screenshot_path)
-            
-            # نقوم بقص منطقة الزاوية العلوية اليسرى حيث يظهر الوقت عادة (03:00:00)
-            # نسبة القص تقريبية بناء على الصورة المعروضة
-            width, height = img.size
-            # قص المنطقة المحتوية على "Start Lab" والوقت (يسار - أعلى)
-            left = int(width * 0.05)
-            top = int(height * 0.25)
-            right = int(width * 0.30) 
-            bottom = int(height * 0.45)
-            
-            cropped_img = img.crop((left, top, right, bottom))
-            cropped_img.save(crop_path)
-            
-            # تحويل للرمادي وتحسين الحدة للقراءة
-            img_gray = cropped_img.convert('L')
-            img_filtered = img_gray.filter(ImageFilter.SHARPEN)
-            
-            # استخراج النص
-            custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789:'
-            text = pytesseract.image_to_string(img_filtered, config=custom_config)
-            
-            print(f"النص المستخرج بالـ OCR: '{text}'")
-            
-            # البحث عن نمط الوقت في النص المستخرج
-            ocr_match = re.search(r'(\d{2}:\d{2}:\d{2})', text)
-            if ocr_match:
-                found_time = ocr_match.group(1)
-            
-            # تنظيف الملفات المؤقتة
-            os.remove(crop_path)
+        # --- الخطوة 3: استخراج الوقت بالطرق المتعددة ---
+        extracted_time = "NULL"
+        method_used = "None"
+        
+        # الطريقة A: JavaScript (الأقوى - يقرأ ما يراه المتصفح فعلاً)
+        try:
+            js_code = """
+                // البحث في كل نصوص الصفحة عن نمط HH:MM:SS
+                const bodyText = document.body.innerText;
+                const matches = bodyText.match(/\b\d{2}:\d{2}:\d{2}\b/g);
+                // نعيد أول تطابق يكون من منطقة المحتوى وليس الهيدر/الفوتر غالباً
+                return matches ? matches[0] : 'NOT_FOUND';
+            """
+            result_js = driver.execute_script(js_code)
+            if result_js != 'NOT_FOUND' and len(result_js) == 8:
+                extracted_time = result_js
+                method_used = "JS_Execute_Script"
+                print(f"[FOUND] بالـ JavaScript: {extracted_time}")
+        except Exception as e:
+            print(f"[ERR] JS Failed: {e}")
 
-        # ---------------------------------------------------
-        # إرسال النتيجة النهائية
-        # ---------------------------------------------------
-        final_img = "final_ss.png"
-        driver.save_screenshot(final_img)
-        
-        if found_time and found_time != "00:00:00":
-            response_msg = f"✅ **تم العثور على الوقت المتبقي:**\n🕐 `{found_time}`\n\n📸 التقطت الصورة للتأكيد:"
-        else:
-            response_msg = f"⚠️ **لم أستطع قراءة الوقت تلقائياً**\n\n👇 انظر إلى الصورة أسفل الرسالة واقرأ الوقت يدوياً في الزاوية:"
+        # الطريقة B: البحث في Source Code (Regex)
+        if extracted_time == "NULL":
+            try:
+                source = driver.page_source
+                source_match = re.search(r'>\s*(\d{2}:\d{2}:\d{2})\s*<', source)
+                if source_match:
+                    extracted_time = source_match.group(1)
+                    method_used = "HTML_Source_Regex"
+            except:
+                pass
+                
+        # الطريقة C: OCR على صورة كاملة (بعد تحسينها بالأسود والأبيض)
+        if extracted_time == "NULL":
+            print("[4] اللجوء للـ OCR...")
+            ss_path = "debug_screenshot.png"
+            driver.save_screenshot(ss_path)
             
-        with open(final_img, 'rb') as photo:
+            img = Image.open(ss_path)
+            
+            # تحويل لرمادي ثم ثنائي (Black & White) لتسهيل القراءة
+            img_gray = img.convert('L')
+            # زيادة الحدة
+            img_bw = img_gray.point(lambda x: 0 if x < 150 else 255, '1')
+            
+            config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789:'
+            text = pytesseract.image_to_string(img_bw, config=config).strip()
+            
+            print(f"[OCR] النص المقروء: '{text}'")
+            
+            ocr_match = re.search(r'\b(\d{2}:\d{2}:\d{2})\b', text)
+            if ocr_match:
+                extracted_time = ocr_match.group(1)
+                method_used = "OCR_Image"
+                
+            os.remove(ss_path)
+
+        # --- الخطوة 4: إرسال النتيجة والتصحيح ---
+        final_ss = "result.png"
+        driver.save_screenshot(final_ss)
+        
+        # بناء رسالة التصحيح (Debug Info) لتعرف أين الخلل
+        current_url = driver.current_url
+        title = driver.title
+        
+        debug_info = (
+            f"🔍 **معلومات التصحيح:**\n"
+            f"• **الرابط الحالي:** `{current_url[:50]}...`\n"
+            f"• **عنوان الصفحة:** {title}\n"
+            f"• **طريقة الاستخراج:** `{method_used}`\n"
+            f"• **الوقت:** `{extracted_time}`\n"
+            f"• **حالة الكوكيز:** تم تحميل {cookies_loaded} عنصر\n\n"
+        )
+        
+        if extracted_time != "NULL":
+            msg_text = f"⏱️ **الوقت المتبقي في الLab:**\n🕐 **`{extracted_time}`**\n\n" + debug_info
+        else:
+            msg_text = f"❌ **لم أجد الوقت!**\n\n" + debug_info + ("📸 **أنظر للصورة لترى ما ظهر: **\n*ملاحظة:* هل ترى شاشة تسجيل دخول؟ هذا يعني الكوكيز غير صحيحة.")
+            
+        with open(final_ss, 'rb') as photo:
             bot.send_photo(
                 message.chat.id,
                 photo,
-                caption=response_msg,
+                caption=msg_text,
                 parse_mode='Markdown'
             )
             
-        os.remove(final_img)
-        if os.path.exists("ss_raw.png"):
-            os.remove("ss_raw.png")
-            
-        bot.edit_message_text("✅ تم الفحص!", msg.chat.id, msg.message_id)
+        os.remove(final_ss)
+        bot.edit_message_text("✅ تم الانتهاء!", status_msg.chat.id, status_msg.message_id)
 
     except Exception as e:
-        error_text = f"❌ خطأ: {str(e)}"
-        try:
-            bot.edit_message_text(error_text, msg.chat.id, msg.message_id)
-        except:
-            pass
+        error_report = f"💥 **خطأ برمجي قاتل:**\n`{str(e)}`\n\nيرجى مراجعة سجل (Logs) Railway."
+        bot.send_message(message.chat.id, error_report, parse_mode='Markdown')
     finally:
         if driver:
             driver.quit()
 
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "مرحباً! أرسل /time وانتظر.")
+
 if __name__ == '__main__':
-    print("Bot is running with OCR capabilities...")
+    print("Bot V3.0 - With Enhanced Debugging & Fixed Paths")
     bot.infinity_polling()
