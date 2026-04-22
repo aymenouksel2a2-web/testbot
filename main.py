@@ -1,10 +1,8 @@
 import os
 import telebot
-import requests
-from bs4 import BeautifulSoup
 import re
+from playwright.sync_api import sync_playwright
 
-# جلب التوكن من Railway
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -16,27 +14,23 @@ def send_welcome(message):
 def fetch_lab_time(message):
     url = "https://www.skills.google/focuses/19146?parent=catalog"
     
-    # إرسال رسالة للمستخدم بأن البوت يعمل على جلب البيانات
-    msg = bot.reply_to(message, "⏳ جاري الاتصال بالموقع واستخراج الوقت...")
+    # إشعار المستخدم بأن العملية قد تستغرق وقتاً قليلاً
+    msg = bot.reply_to(message, "⏳ جاري تشغيل المتصفح وتحليل الصفحة (قد يستغرق بضع ثوانٍ)...")
     
     try:
-        # إضافة User-Agent لكي لا يظن الموقع أننا روبوت خبيث
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-        }
-        
-        # جلب الصفحة
-        response = requests.get(url, headers=headers)
-        
-        if response.status_code == 200:
-            # تحليل محتوى الصفحة
-            soup = BeautifulSoup(response.text, 'html.parser')
+        # تشغيل Playwright لفتح المتصفح
+        with sync_playwright() as p:
+            # إطلاق متصفح Chromium في وضع الخلفية (headless=True)
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
             
-            # استخراج كل النص الموجود في الصفحة
-            page_text = soup.get_text()
+            # الدخول للرابط والانتظار حتى يتم تحميل كافة سكريبتات الصفحة (networkidle)
+            page.goto(url, wait_until="networkidle")
             
-            # البحث عن نمط الوقت (رقمين:رقمين:رقمين) مثل 03:00:00
-            # \d{2} تعني رقمين، و : هو الفاصل
+            # سحب النص الظاهر للمستخدم بعد اكتمال التحميل
+            page_text = page.inner_text("body")
+            
+            # البحث عن نمط الوقت باستخدام Regex
             time_pattern = re.search(r'\d{2}:\d{2}:\d{2}', page_text)
             
             if time_pattern:
@@ -45,15 +39,14 @@ def fetch_lab_time(message):
                                       text=f"✅ تم العثور على الوقت بنجاح!\n\n⏱️ الوقت المخصص للمختبر هو: **{extracted_time}**", parse_mode="Markdown")
             else:
                 bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, 
-                                      text="❌ لم أتمكن من العثور على الوقت. قد يكون الموقع يعتمد على JavaScript لعرض الوقت (Dynamic Content).")
-        else:
-            bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, 
-                                  text=f"⚠️ حدث خطأ في الوصول للموقع. كود الخطأ: {response.status_code}")
+                                      text="❌ لم أتمكن من العثور على الوقت. قد يكون الموقع قام بتغيير هيكله.")
+            
+            # إغلاق المتصفح لتحرير الموارد
+            browser.close()
             
     except Exception as e:
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, 
-                              text=f"حدث خطأ غير متوقع: {e}")
+                              text=f"⚠️ حدث خطأ أثناء تشغيل المتصفح: {e}")
 
-# إبقاء البوت قيد التشغيل
-print("Bot is running...")
+print("Bot is running with Playwright...")
 bot.infinity_polling()
