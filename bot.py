@@ -4,7 +4,7 @@ import time
 import threading
 
 # ضع توكن البوت الخاص بك هنا (من BotFather)
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+BOT_TOKEN = "7444106461:AAFZCj0Xs-3qnMqKtQf6vxKp_Nh53BQMIqY"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # متغير للتحكم في حالة البث
