@@ -26,10 +26,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• وضع البرومبت:\n"
         "   السطر 1: الرابط\n"
         "   السطر 2: البرومبت/الرسالة\n\n"
+        "إذا كان الموقع يتطلب تسجيل دخول، سأطلب منك البريد وكلمة المرور تلقائياً.\n\n"
         "سألتقط صوراً لكي ترى ما يحدث!"
     )
 
-async def monitor_url_task(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, prompt: str | None):
+async def run_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, prompt: str | None, email: str | None = None, password: str | None = None):
     chat_id = update.effective_chat.id
     browser = None
 
@@ -44,22 +45,51 @@ async def monitor_url_task(update: Update, context: ContextTypes.DEFAULT_TYPE, u
             )
             page = await page_context.new_page()
 
-            # نفتح الرابط وننتظر تحميل الصفحة (networkidle جيد للمواقع الديناميكية)
             await page.goto(url, wait_until="networkidle", timeout=30000)
+
+            # ─── تسجيل الدخول إذا توفرت بيانات ───
+            if email and password:
+                await context.bot.send_message(chat_id=chat_id, text="🔐 جاري تسجيل الدخول...")
+                await page.wait_for_timeout(1000)
+
+                login_btn = page.locator('button:has-text("Log in"), a:has-text("Log in"), button:has-text("Login"), a:has-text("Login")').first
+                if await login_btn.count() > 0 and await login_btn.is_visible():
+                    await login_btn.click()
+                    await page.wait_for_timeout(2000)
+
+                email_input = page.locator('input[type="email"]').first
+                if await email_input.count() == 0:
+                    email_input = page.locator('input[name="email"], input[name="username"], input[placeholder*="email" i], input[placeholder*="e-mail" i], input[id*="email" i]').first
+
+                pass_input = page.locator('input[type="password"]').first
+
+                if await email_input.count() > 0 and await pass_input.count() > 0:
+                    await email_input.fill(email)
+                    await pass_input.fill(password)
+
+                    submit_btn = page.locator('button[type="submit"], button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), input[type="submit"]').first
+                    if await submit_btn.count() > 0:
+                        await submit_btn.click()
+                        await page.wait_for_timeout(3000)
+                        await page.wait_for_load_state("networkidle")
+                    else:
+                        await pass_input.press("Enter")
+                        await page.wait_for_timeout(3000)
+                        await page.wait_for_load_state("networkidle")
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text="⚠️ لم أجد حقول تسجيل الدخول التقليدية، سأستمر بالوضع الحالي.")
 
             # ─── وضع البرومبت ───
             if prompt:
                 await context.bot.send_message(chat_id=chat_id, text="⌨️ جاري البحث عن حقل الكتابة...")
                 await page.wait_for_timeout(1500)
 
-                # 1️⃣ البحث الذكي عن حقل الإدخال (3 استراتيجيات)
                 input_box = None
                 locators_to_try = [
-                    page.locator("textarea").first,                 # معظم مواقع الدردشة
-                    page.locator('input[type="text"]').last,        # حقل نصي عام
-                    page.locator('[contenteditable="true"]').first, # محررات غنية
+                    page.locator("textarea").first,
+                    page.locator('input[type="text"]').last,
+                    page.locator('[contenteditable="true"]').first,
                 ]
-                # كلمات شائعة في placeholder أو aria-label
                 for keyword in ["message", "chat", "ask", "search", "prompt", "say something", "type here", "write"]:
                     locators_to_try.append(page.locator(f'[placeholder*="{keyword}" i]').first)
                     locators_to_try.append(page.locator(f'[aria-label*="{keyword}" i]').first)
@@ -86,7 +116,6 @@ async def monitor_url_task(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                         await input_box.press("Enter")
                         await page.wait_for_timeout(500)
 
-                        # محاولة إضافية: النقر على زر Send إذا وجده
                         try:
                             send_btn = page.locator('button:has-text("Send"), button[type="submit"]').first
                             if await send_btn.count() > 0 and await send_btn.is_visible():
@@ -98,7 +127,6 @@ async def monitor_url_task(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                     except Exception as e:
                         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ خطأ أثناء الكتابة: {e}")
 
-                # التقاط 5 صور كل 4 ثوانٍ (نعطي الوقت للموقع ليُظهر الرد)
                 for i in range(1, 6):
                     await asyncio.sleep(4)
                     screenshot_bytes = await page.screenshot(type="png", full_page=False)
@@ -137,10 +165,80 @@ async def monitor_url_task(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         if browser:
             await browser.close()
 
+async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, prompt: str | None):
+    chat_id = update.effective_chat.id
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page_context = await browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await page_context.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+
+            needs_login = False
+
+            login_btn = page.locator('button:has-text("Log in"), a:has-text("Log in"), button:has-text("Login"), a:has-text("Login")').first
+            try:
+                if await login_btn.count() > 0 and await login_btn.is_visible():
+                    needs_login = True
+            except Exception:
+                pass
+
+            if not needs_login:
+                signup_btn = page.locator('button:has-text("Sign up"), a:has-text("Sign up"), button:has-text("Sign Up")').first
+                try:
+                    if await signup_btn.count() > 0 and await signup_btn.is_visible():
+                        needs_login = True
+                except Exception:
+                    pass
+
+            if needs_login:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="🔐 هذا الموقع يتطلب تسجيل الدخول.\n\n"
+                         "الخطوة 1/2: أرسل بريدك الإلكتروني (Email)."
+                )
+                context.user_data['pending_auth'] = {
+                    'url': url,
+                    'prompt': prompt,
+                    'step': 'email'
+                }
+            else:
+                asyncio.create_task(run_monitor(update, context, url, prompt))
+
+    except Exception as e:
+        logging.error(f"Check login error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ خطأ أثناء فحص الموقع:\n<code>{e}</code>", parse_mode="HTML")
+    finally:
+        if browser:
+            await browser.close()
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text:
         return
+
+    pending = context.user_data.get('pending_auth')
+    if pending:
+        step = pending.get('step')
+        if step == 'email':
+            context.user_data['pending_auth']['email'] = text
+            context.user_data['pending_auth']['step'] = 'password'
+            await update.message.reply_text("🔑 الخطوة 2/2: أرسل كلمة المرور (Password).")
+            return
+        elif step == 'password':
+            email = pending.get('email')
+            password = text
+            url = pending.get('url')
+            prompt = pending.get('prompt')
+            if 'pending_auth' in context.user_data:
+                del context.user_data['pending_auth']
+            await update.message.reply_text("⏳ جاري تسجيل الدخول والتنفيذ...")
+            asyncio.create_task(run_monitor(update, context, url, prompt, email, password))
+            return
 
     lines = text.split("\n", 1)
     first_line = lines[0].strip()
@@ -148,7 +246,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if url:
         prompt = lines[1].strip() if len(lines) > 1 else None
-        asyncio.create_task(monitor_url_task(update, context, url, prompt))
+        asyncio.create_task(process_url(update, context, url, prompt))
     else:
         await update.message.reply_text(
             "❌ لم أتعرف على رابط.\n\n"
