@@ -34,31 +34,37 @@ def extract_lab_time(chat_id, url):
             # تعيين أبعاد الشاشة
             page.set_viewport_size({"width": 1280, "height": 720})
             
-            bot.send_message(chat_id, "⏳ جاري الدخول للصفحة والبحث عن وقت اللاب الحقيقي...")
+            bot.send_message(chat_id, "⏳ جاري الدخول للصفحة... سأقوم باستخراج الوقت بالقوة الإجبارية 🕵️‍♂️")
             
-            # الدخول للرابط والانتظار حتى اكتمال تحميل الشبكة لتجنب أخذ نصوص غير مكتملة
+            # الدخول للرابط والانتظار حتى اكتمال تحميل الشبكة
             page.goto(url, timeout=60000, wait_until="networkidle") 
-            time.sleep(3) # إعطاء مهلة إضافية ليظهر العداد الفعلي
-            
-            # نمط البحث (Regex): تم إجبار البحث على 6 أرقام بالضبط (مثال 03:00:00) 
-            # هذا يمنع البوت من قراءة النص "1:15:00" الموجود كـ(مثال) داخل تعليمات اللاب.
-            time_regex = r"\d{2}:\d{2}:\d{2}"
+            time.sleep(5) # مهلة إضافية لضمان استقرار الصفحة بالكامل وظهور العداد
             
             lab_time = None
             
-            # استخراج النص الكامل للصفحة للبحث فيه بدقة
-            full_page_text = page.locator("body").inner_text()
+            # الحل الجذري: حقن كود جافاسكريبت داخل المتصفح لسحب الوقت بالقوة متجاوزاً (Shadow DOM)
+            js_code = """
+            () => {
+                // سحب كل النصوص المرئية والمخفية في عمق الصفحة
+                let allText = document.documentElement.innerText || document.body.textContent;
+                // البحث عن صيغة 00:00:00 (رقمين:رقمين:رقمين)
+                let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
+                return match ? match[0] : null;
+            }
+            """
             
-            # 1. نبحث أولاً عن الوقت المرتبط مباشرة بكلمة Time limit لضمان الدقة القصوى
-            match_exact = re.search(r"(\d{2}:\d{2}:\d{2})\s*(?:\n\s*)?(?:\?|Time limit)", full_page_text, re.IGNORECASE)
+            # تنفيذ الكود داخل الصفحة
+            lab_time = page.evaluate(js_code)
             
-            if match_exact:
-                lab_time = match_exact.group(1)
-            else:
-                # 2. في حال لم يجده بالشكل السابق، يبحث عن أي عداد بـ 6 أرقام (03:00:00)
-                fallback_match = re.search(time_regex, full_page_text)
-                if fallback_match:
-                    lab_time = fallback_match.group(0)
+            # إذا لم ينجح الجافاسكريبت (نادر جداً)، نستخدم بحث Playwright العميق كخطة بديلة
+            if not lab_time:
+                elements = page.locator("text=/[0-9]{2}:[0-9]{2}:[0-9]{2}/").all()
+                for el in elements:
+                    text = el.inner_text().strip()
+                    match = re.search(r"\b\d{2}:\d{2}:\d{2}\b", text)
+                    if match:
+                        lab_time = match.group(0)
+                        break
             
             # التقاط صورة للصفحة كمرجع
             screenshot_bytes = page.screenshot(full_page=False)
@@ -66,9 +72,9 @@ def extract_lab_time(chat_id, url):
             
             # إرسال النتيجة المستخرجة
             if lab_time:
-                bot.send_message(chat_id, f"✅ **وقت اللاب المستخرج:**\n\n⏱️ `{lab_time}`", parse_mode="Markdown")
+                bot.send_message(chat_id, f"✅ **وقت اللاب المستخرج بنجاح:**\n\n⏱️ `{lab_time}`", parse_mode="Markdown")
             else:
-                bot.send_message(chat_id, "⚠️ لم أتمكن من العثور على وقت اللاب في الصفحة. تأكد من أن العداد يظهر دون الحاجة لتسجيل دخول إضافي.")
+                bot.send_message(chat_id, "⚠️ ما زلت أواجه صعوبة في قراءة النص برمجياً رغم ظهوره في الصورة! قد يكون الموقع وضع العداد كرسوم (Canvas).")
             
             browser.close()
                 
