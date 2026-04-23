@@ -11,7 +11,6 @@ COPY . .
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
-# إنشاء مجلد البيانات المستمر مع صلاحيات للمستخدم pwuser
 RUN mkdir -p /tmp/gratisfy-data && chown -R pwuser:pwuser /tmp/gratisfy-data
 
 USER pwuser
