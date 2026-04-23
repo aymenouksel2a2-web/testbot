@@ -1,14 +1,12 @@
 # nixpacks.toml
 [phases.setup]
-nixPkgs = ["playwright"]
+nixPkgs = ["chromium"]
 
 [phases.install]
 cmds = [
-    "mkdir -p /app/.playwright-browsers",
-    "export PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers",
-    "playwright install chromium",
-    "playwright install-deps chromium"
+    "export CHROME_BIN=$(which chromium)",
+    "echo CHROME_BIN=$CHROME_BIN >> .env"
 ]
 
 [variables]
-PLAYWRIGHT_BROWSERS_PATH = "/app/.playwright-browsers"
+CHROME_BIN = "/nix/var/nix/profiles/default/bin/chromium"
