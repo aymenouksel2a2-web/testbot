@@ -31,7 +31,7 @@ def extract_lab_time(chat_id, url):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             
-            # تعيين أبعاد الشاشة
+            # تعيين أبعاد الشاشة (يمكنك تركها حتى لو لم نلتقط صورة لأنها تساعد في تحميل الصفحة بشكل صحيح)
             page.set_viewport_size({"width": 1280, "height": 720})
             
             bot.send_message(chat_id, "⏳ جاري الدخول للصفحة... سأقوم باستخراج الوقت بالقوة الإجبارية 🕵️‍♂️")
@@ -66,15 +66,11 @@ def extract_lab_time(chat_id, url):
                         lab_time = match.group(0)
                         break
             
-            # التقاط صورة للصفحة كمرجع
-            screenshot_bytes = page.screenshot(full_page=False)
-            bot.send_photo(chat_id, screenshot_bytes, caption="📸 لقطة شاشة للصفحة")
-            
             # إرسال النتيجة المستخرجة
             if lab_time:
                 bot.send_message(chat_id, f"✅ **وقت اللاب المستخرج بنجاح:**\n\n⏱️ `{lab_time}`", parse_mode="Markdown")
             else:
-                bot.send_message(chat_id, "⚠️ ما زلت أواجه صعوبة في قراءة النص برمجياً رغم ظهوره في الصورة! قد يكون الموقع وضع العداد كرسوم (Canvas).")
+                bot.send_message(chat_id, "⚠️ لم أتمكن من العثور على وقت اللاب في الصفحة.")
             
             browser.close()
                 
@@ -90,7 +86,7 @@ def extract_lab_time(chat_id, url):
 def send_welcome(message):
     welcome_text = (
         "مرحباً! 🤖\n\n"
-        "أرسل لي رابط اللاب (Google Skills) وسأقوم باستخراج **وقت اللاب المخصص (Time limit)** فقط وإرساله لك مع لقطة شاشة.\n"
+        "أرسل لي رابط اللاب (Google Skills) وسأقوم باستخراج **وقت اللاب المخصص (Time limit)** فقط وإرساله لك.\n"
     )
     bot.reply_to(message, welcome_text)
 
