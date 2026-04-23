@@ -1,0 +1,11 @@
+[phases.setup]
+cmds = [
+  "npm install -g playwright",
+  "playwright install --with-deps chromium"
+]
+
+[phases.setup.dependencies]
+apt = ["python3", "python3-pip", "curl"]
+
+[start]
+cmd = "python3 main.py"
