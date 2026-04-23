@@ -1,7 +1,6 @@
 import json
 import aiohttp
 import os
-import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from playwright.async_api import async_playwright
@@ -12,30 +11,26 @@ cookies = None
 headers = None
 
 async def take_screenshot(page, update):
-    try:
-        screenshot = await page.screenshot(type='png')
-        await update.message.reply_photo(
-            photo=screenshot,
-            caption="📸 **Screenshot from gratisfy.xyz**\nشوف إيه اللي بيظهر يا قحبة"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to take screenshot: {str(e)}")
+    screenshot = await page.screenshot(type='png')
+    await update.message.reply_photo(photo=screenshot, caption="📸 Screenshot from gratisfy.xyz")
 
 async def init_browser(update=None):
     global cookies, headers
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(
+            headless=True, 
+            args=["--no-sandbox", "--disable-setuid-sandbox"]
+        )
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         )
         
         page = await context.new_page()
-        await page.goto("https://gratisfy.xyz", wait_until="domcontentloaded", timeout=30000)
+        await page.goto("https://gratisfy.xyz", wait_until="domcontentloaded", timeout=45000)
         
         if update:
             await take_screenshot(page, update)
         
-        # Extract cookies
         cookies_list = await context.cookies()
         cookies = {c['name']: c['value'] for c in cookies_list}
         
@@ -49,20 +44,20 @@ async def init_browser(update=None):
         }
         
         await browser.close()
+        print("✅ Browser initialized successfully with cookies")
         return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 جاري فتح المتصفح وتجاوز Cloudflare...\nهيجيبلك سكرين شوت في ثواني يا شرموط")
+    await update.message.reply_text("🔄 جاري تشغيل المتصفح وتجاوز Cloudflare...\nانتظر السكرين شوت يا زبي")
     await init_browser(update)
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global cookies, headers
-    user_msg = update.message.text.strip()
-
-    if not cookies or not headers:
-        await update.message.reply_text("🔄 أول مرة... جاري تهيئة المتصفح...")
+    if not cookies:
+        await update.message.reply_text("🔄 أول استخدام... جاري تهيئة المتصفح")
         await init_browser(update)
 
+    user_msg = update.message.text.strip()
     await update.message.reply_chat_action("typing")
 
     payload = {
@@ -71,33 +66,33 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "messages": [{"role": "user", "content": [{"type": "text", "text": user_msg}]}]
     }
 
-    full_response = ""
+    full = ""
     msg = None
 
     try:
         async with aiohttp.ClientSession(cookies=cookies) as session:
             async with session.post("https://gratisfy.xyz/api/chat", json=payload, headers=headers) as resp:
                 if resp.status == 401:
-                    await update.message.reply_text("❌ 401 لسة موجود. جاري إعادة التهيئة...")
+                    await update.message.reply_text("❌ 401 - جاري إعادة تشغيل المتصفح...")
                     await init_browser(update)
                     return
-                
-                async for line_bytes in resp.content:
-                    line = line_bytes.decode('utf-8').strip()
+
+                async for line in resp.content:
+                    line = line.decode('utf-8').strip()
                     if line.startswith("data: "):
                         data = line[6:]
-                        if data == "[DONE]":
+                        if data == "[DONE]": 
                             break
                         try:
                             chunk = json.loads(data)
                             if chunk.get("choices") and chunk["choices"][0].get("delta", {}).get("content"):
                                 content = chunk["choices"][0]["delta"]["content"]
-                                full_response += content
+                                full += content
                                 if msg is None:
-                                    msg = await update.message.reply_text(full_response)
+                                    msg = await update.message.reply_text(full)
                                 else:
                                     try:
-                                        await msg.edit_text(full_response)
+                                        await msg.edit_text(full)
                                     except:
                                         pass
                         except:
@@ -109,8 +104,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-    
-    print("🚀 Grok AI Automation Bot v4 Started on Railway")
+    print("🚀 Grok AI Bot v5 Started")
     app.run_polling()
 
 if __name__ == "__main__":
