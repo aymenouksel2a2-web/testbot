@@ -283,21 +283,18 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     await snap("🔑 جاري إرسال تسجيل الدخول...")
                     
                     # الأسلوب الأكثر موثوقية: الضغط على Enter في حقل كلمة المرور
-                    # يُرسل النموذج دائماً حتى لو لم نعثر على الزر
                     await pass_input.press("Enter")
                     await asyncio.sleep(1.0)
                     await page.wait_for_timeout(3000)
                     
                     # ─── Fallback: محاولة النقر على زر Submit إن وجد ───
-                    # نحاول النقر على زر الإرسال في حال لم يعمل Enter (مواقع React)
                     try:
                         submit_btn = page.locator('button[type="submit"]').last
                         await submit_btn.wait_for(state="visible", timeout=3000)
-                        # نتحقق أن الزر داخل نموذج الدخول (ليس في صفحة أخرى)
                         await submit_btn.click(timeout=5000)
                         await page.wait_for_timeout(2000)
                     except Exception:
-                        pass # Enter كافٍ في الغالب
+                        pass
 
                     # ─── Fallback آخر: أي زر Sign in في الأسفل ───
                     try:
@@ -312,7 +309,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     await page.wait_for_timeout(3000)
 
                     # ─── التحقق من نجاح الدخول ───
-                    # إذا بقي زر Log in في الهيدر ظاهراً، الدخول لم ينجح
                     login_still_visible = False
                     try:
                         hdr_login = page.locator('header').locator('button:has-text("Log in"), a:has-text("Log in")').first
@@ -324,6 +320,16 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                         await snap("⚠️ بقي زر Log in ظاهراً (بيانات خاطئة؟)، البث مستمر...")
                     else:
                         await snap("✅ تم تسجيل الدخول! البث المباشر يعمل الآن.")
+                    
+                    await asyncio.sleep(1.5)
+
+                    # ═══════════════════════════════════════════════════
+                    #  🔄 الانتقال إلى صفحة الدردشة بعد تسجيل الدخول
+                    # ═══════════════════════════════════════════════════
+                    await snap("💬 جاري الانتقال إلى صفحة الدردشة...")
+                    await page.goto("https://gratisfy.xyz/chat", wait_until="domcontentloaded", timeout=60000)
+                    await asyncio.sleep(1.5)
+                    await snap("💬 تم الانتقال إلى صفحة الدردشة · البث مستمر")
 
                 except PlaywrightTimeout:
                     await snap("ℹ️ انتهى الوقت أثناء التفاعل مع نموذج الدخول، البث مستمر...")
