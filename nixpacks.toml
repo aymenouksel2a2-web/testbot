@@ -1,7 +1,6 @@
 # nixpacks.toml
 [phases.setup]
-nixPkgs = ["chromium", "chromedriver"]
+nixPkgs = ["playwright"]
 
-[variables]
-CHROME_BIN = "/nix/var/nix/profiles/default/bin/chromium"
-CHROMEDRIVER_PATH = "/nix/var/nix/profiles/default/bin/chromedriver"
+[phases.install]
+cmds = ["playwright install chromium"]
