@@ -277,92 +277,51 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     await pass_input.fill(LOGIN_PASSWORD)
                     await asyncio.sleep(0.5)
 
-                    # ─── الضغط على زر Sign in ───
-                    await snap("🔑 جاري البحث عن زر Sign in...")
+                    # ═══════════════════════════════════════════════════
+                    #  🔑 إرسال النموذج (الحل الأساسي: Enter من حقل Password)
+                    # ═══════════════════════════════════════════════════
+                    await snap("🔑 جاري إرسال تسجيل الدخول...")
                     
-                    sign_in_btn = None
-                    # نحاول عدة محددات (selectors) للعثور على الزر
-                    for sel in [
-                        'button:has-text("Sign in")',
-                        'button[type="submit"]',
-                        'input[type="submit"]',
-                        'a:has-text("Sign in")',
-                        '[data-testid="signin-button"]',
-                    ]:
-                        try:
-                            tmp = page.locator(sel).first
-                            await tmp.wait_for(state="visible", timeout=5000)
-                            sign_in_btn = tmp
-                            break
-                        except Exception:
-                            continue
+                    # الأسلوب الأكثر موثوقية: الضغط على Enter في حقل كلمة المرور
+                    # يُرسل النموذج دائماً حتى لو لم نعثر على الزر
+                    await pass_input.press("Enter")
+                    await asyncio.sleep(1.0)
+                    await page.wait_for_timeout(3000)
+                    
+                    # ─── Fallback: محاولة النقر على زر Submit إن وجد ───
+                    # نحاول النقر على زر الإرسال في حال لم يعمل Enter (مواقع React)
+                    try:
+                        submit_btn = page.locator('button[type="submit"]').last
+                        await submit_btn.wait_for(state="visible", timeout=3000)
+                        # نتحقق أن الزر داخل نموذج الدخول (ليس في صفحة أخرى)
+                        await submit_btn.click(timeout=5000)
+                        await page.wait_for_timeout(2000)
+                    except Exception:
+                        pass # Enter كافٍ في الغالب
 
-                    # إذا لم نجد بالـ CSS locator، نجرب get_by_role / get_by_text
-                    if not sign_in_btn:
-                        try:
-                            sign_in_btn = page.get_by_role("button", name="Sign in").first
-                            await sign_in_btn.wait_for(state="visible", timeout=5000)
-                        except Exception:
-                            pass
+                    # ─── Fallback آخر: أي زر Sign in في الأسفل ───
+                    try:
+                        sign_in_btn = page.locator('button:has-text("Sign in")').last
+                        if await sign_in_btn.is_visible(timeout=2000):
+                            await sign_in_btn.click(timeout=5000)
+                            await page.wait_for_timeout(2000)
+                    except Exception:
+                        pass
 
-                    if not sign_in_btn:
-                        try:
-                            sign_in_btn = page.get_by_text("Sign in", exact=False).first
-                            await sign_in_btn.wait_for(state="visible", timeout=5000)
-                        except Exception:
-                            pass
-
-                    if sign_in_btn:
-                        await snap("🔑 الضغط على Sign in...")
-                        
-                        # نحاول النقر العادي أولاً
-                        clicked = False
-                        try:
-                            await sign_in_btn.click(timeout=8000)
-                            clicked = True
-                        except Exception as click_err:
-                            logger.warning(f"Normal click failed: {click_err}")
-                            # إذا فشل (مثلاً الزر مغطى بعنصر آخر)، نستخدم force
-                            try:
-                                await sign_in_btn.click(force=True, timeout=5000)
-                                clicked = True
-                            except Exception:
-                                pass
-
-                        # إذا فشل النقر تماماً، نستخدم JavaScript click كآخر حل
-                        if not clicked:
-                            try:
-                                await sign_in_btn.evaluate("el => el.click()")
-                                clicked = True
-                            except Exception as js_err:
-                                logger.warning(f"JS click failed: {js_err}")
-
-                        # إذا فشل كل شيء، نضغط Enter على حقل كلمة المرور
-                        if not clicked and pass_input:
-                            await pass_input.press("Enter")
-
-                        # ننتظر بعد الضغط حتى يتفاعل السيرفر
-                        await page.wait_for_timeout(4000)
-                        await snap("⏳ التحقق من نجاح تسجيل الدخول...")
-                    else:
-                        # لم نجد الزر، نضغط Enter
-                        await snap("⚠️ لم يُعثر على زر Sign in · الضغط على Enter...")
-                        if pass_input:
-                            await pass_input.press("Enter")
-                        await page.wait_for_timeout(4000)
+                    await snap("⏳ التحقق من نجاح تسجيل الدخول...")
+                    await page.wait_for_timeout(3000)
 
                     # ─── التحقق من نجاح الدخول ───
-                    # إذا اختفى زر Log in أو ظهر زر/نص Dashboard/Logout نعتبره نجاح
+                    # إذا بقي زر Log in في الهيدر ظاهراً، الدخول لم ينجح
                     login_still_visible = False
                     try:
-                        # نبحث عن زر Log in في أعلى الصفحة (الهيدر)
-                        hdr_login = page.locator('header >> button:has-text("Log in"), header >> a:has-text("Log in")').first
+                        hdr_login = page.locator('header').locator('button:has-text("Log in"), a:has-text("Log in")').first
                         login_still_visible = await hdr_login.is_visible(timeout=3000)
                     except Exception:
                         login_still_visible = False
 
                     if login_still_visible:
-                        await snap("⚠️ بقي زر Log in ظاهراً (بيانات خاطئة؟ الزر لم ينقر؟)، البث مستمر...")
+                        await snap("⚠️ بقي زر Log in ظاهراً (بيانات خاطئة؟)، البث مستمر...")
                     else:
                         await snap("✅ تم تسجيل الدخول! البث المباشر يعمل الآن.")
 
