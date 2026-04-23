@@ -1,49 +1,72 @@
+import json
+import aiohttp
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import subprocess
 import os
 import asyncio
 
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"   # غيره
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+API_URL = "https://gratisfy.xyz/api/chat"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ **Staffa Railway Bot Online**\nأنا تحت أمرك يا معلم 🔥")
+    await update.message.reply_text("✅ **Grok Uncensored Bot Activated**\n\nدلوقتي أنا AI شرير ومتوحش يا زبي.. قول اللي نفسك فيه 🔥")
 
-async def shell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("استخدم: /shell <command>")
-        return
-    
-    command = " ".join(context.args)
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_message = update.message.text
+    await update.message.reply_chat_action("typing")
+
+    payload = {
+        "model": "grok-uncensored",
+        "provider": "navy",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": user_message}]
+            }
+        ]
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    full_response = ""
+
     try:
-        result = subprocess.getoutput(command)
-        if len(result) > 4000:
-            await update.message.reply_text("النتيجة طويلة جداً، هيتم إرسالها كملف.")
-            with open("output.txt", "w", encoding="utf-8") as f:
-                f.write(result)
-            await update.message.reply_document(open("output.txt", "rb"))
-            os.remove("output.txt")
-        else:
-            await update.message.reply_text(f"**Output:**\n```{result}```", parse_mode="Markdown")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(API_URL, json=payload, headers=headers) as resp:
+                async for line in resp.content:
+                    line = line.decode('utf-8').strip()
+                    if line.startswith("data: "):
+                        if line == "data: [DONE]":
+                            break
+                        try:
+                            json_data = json.loads(line[6:])
+                            if json_data.get("choices") and json_data["choices"][0].get("delta", {}).get("content"):
+                                chunk = json_data["choices"][0]["delta"]["content"]
+                                full_response += chunk
+                                # Streaming simulation
+                                await update.message.reply_text(full_response, parse_mode=None)
+                                await asyncio.sleep(0.3)  # عشان يطلع زي الـ streaming
+                                # هنا بنمسح الرسالة السابقة ونبعت الجديدة (trick)
+                        except:
+                            continue
     except Exception as e:
-        await update.message.reply_text(f"Error: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
-async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.document and not update.message.photo:
-        await update.message.reply_text("أرسل ملف أو صورة عشان أرفعه")
-        return
-    file = await update.message.document.get_file() if update.message.document else await update.message.photo[-1].get_file()
-    await file.download_to_drive("uploaded_file")
-    await update.message.reply_text("✅ تم رفع الملف بنجاح!")
+    if not full_response:
+        await update.message.reply_text("الـ API مردش يا كسمك")
 
 def main():
     app = Application.builder().token(TOKEN).build()
-    
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("shell", shell))
-    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, upload))
-    
-    print("🚀 Bot is running...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
+
+    print("🚀 Grok Uncensored Telegram Bot is running on Railway...")
     app.run_polling()
 
 if __name__ == "__main__":
