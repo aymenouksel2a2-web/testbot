@@ -5,8 +5,11 @@
     "nixpacksPlan": {
       "phases": {
         "setup": {
-          "pkgs": ["python311", "nodejs"],
-          "cmds": ["playwright install --with-deps chromium"]
+          "pkgs": ["python311", "nodejs", "chromium"],
+          "cmds": [
+            "npm install -g playwright",
+            "playwright install --with-deps chromium"
+          ]
         }
       }
     }
