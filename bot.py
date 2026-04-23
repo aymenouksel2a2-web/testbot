@@ -40,6 +40,9 @@ TARGET_MODEL = os.environ.get("TARGET_MODEL", "Grok Uncensored")
 # الفاصل الزمني للبث (ثوانٍ)
 STREAM_INTERVAL = 3
 
+# مجلد حفظ بيانات المتصفح المستمرة (cookies, localStorage...)
+PERSISTENT_DATA_DIR = "/tmp/gratisfy-data"
+
 streams: Dict[int, Dict[str, Any]] = {}
 streams_lock = None
 
@@ -107,7 +110,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    browser = None
+    browser_ctx = None
     pw = None
     page = None
     message_id = None
@@ -151,7 +154,9 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
         pw = await async_playwright().start()
 
-        browser = await pw.chromium.launch(
+        # ─── استخدام متصفح مستمر (يحفظ cookies و localStorage) ───
+        browser_ctx = await pw.chromium.launch_persistent_context(
+            PERSISTENT_DATA_DIR,
             headless=True,
             args=[
                 "--no-sandbox",
@@ -161,10 +166,11 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 "--no-first-run",
                 "--no-zygote",
                 "--single-process",
-            ]
+            ],
+            viewport={"width": 960, "height": 540},
         )
 
-        page = await browser.new_page(viewport={"width": 960, "height": 540})
+        page = await browser_ctx.new_page()
 
         # إخفاء خصائص الأتمتة
         await page.add_init_script("""
@@ -199,14 +205,14 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         # ═══════════════════════════════════════
-        #  🔐 تسجيل الدخول (ذكي: يتحقق أولاً)
+        #  🔐 تسجيل الدخول (ذكي: يتحقق أولاً من حالة الجلسة)
         # ═══════════════════════════════════════
-        login_performed = False
+        needs_login = False
+
         if LOGIN_EMAIL and LOGIN_PASSWORD:
             await snap("🔍 التحقق من حالة تسجيل الدخول...")
 
             # التحقق: هل يوجد زر Log in في الصفحة الحالية؟
-            login_btn = None
             for sel in [
                 'button:has-text("Log in")',
                 'a:has-text("Log in")',
@@ -216,24 +222,31 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             ]:
                 try:
                     tmp = page.locator(sel).first
-                    await tmp.wait_for(state="visible", timeout=5000)
-                    login_btn = tmp
+                    await tmp.wait_for(state="visible", timeout=4000)
+                    needs_login = True
                     break
                 except Exception:
                     continue
 
-            if not login_btn:
+            if not needs_login:
+                # محاولة إضافية: بحث نصي واسع
                 try:
-                    login_btn = page.get_by_text("Log in", exact=False).first
-                    await login_btn.wait_for(state="visible", timeout=3000)
+                    page_text = await page.evaluate("() => document.body.innerText")
+                    if "log in" in page_text.lower() and "sign up" in page_text.lower():
+                        # قد يكون هناك زر مخفي، نتحقق أكثر
+                        login_any = page.locator('text=/Log in/i').first
+                        if await login_any.is_visible(timeout=2000):
+                            needs_login = True
                 except Exception:
-                    login_btn = None
+                    pass
 
-            if login_btn:
-                # ─── يوجد زر Log in → نُسجّل الدخول ───
+            if needs_login:
                 await snap("🔐 يوجد زر Log in · جاري تسجيل الدخول...")
                 try:
+                    login_btn = page.locator('button:has-text("Log in"), a:has-text("Log in")').first
+                    await login_btn.wait_for(state="visible", timeout=5000)
                     await login_btn.click()
+
                     await snap("🔐 تم الضغط على Log in · انتظار النموذج...")
                     await asyncio.sleep(2.5)
                     await page.wait_for_timeout(1000)
@@ -299,8 +312,8 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     await snap("⏳ التحقق من نجاح تسجيل الدخول...")
                     await page.wait_for_timeout(3000)
 
-                    # التحقق: هل زر Log in اختفى؟
-                    login_gone = True
+                    # التحقق النهائي: هل زر Log in اختفى؟
+                    login_still_there = False
                     for sel in [
                         'button:has-text("Log in")',
                         'a:has-text("Log in")',
@@ -308,15 +321,14 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     ]:
                         try:
                             tmp = page.locator(sel).first
-                            await tmp.wait_for(state="visible", timeout=2000)
-                            login_gone = False
+                            await tmp.wait_for(state="visible", timeout=3000)
+                            login_still_there = True
                             break
                         except Exception:
                             continue
 
-                    if login_gone:
-                        login_performed = True
-                        await snap("✅ تم تسجيل الدخول بنجاح!")
+                    if not login_still_there:
+                        await snap("✅ تم تسجيل الدخول بنجاح! (سيتم الحفظ للمرات القادمة)")
                     else:
                         await snap("⚠️ بقي زر Log in ظاهراً (بيانات خاطئة؟)")
 
@@ -326,40 +338,14 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Login flow error: {login_err}")
                     await snap(f"⚠️ خطأ في تسجيل الدخول: {login_err}")
             else:
-                # ─── لا يوجد زر Log in → مسجل مسبقاً ───
-                await snap("✅ أنت مسجل بالفعل (لا يوجد زر Log in)")
+                await snap("✅ أنت مسجل بالفعل! (جلسة محفوظة)")
 
-            # ─── الانتقال إلى /chat (بعد التسجيل أو تخطيه) ───
-            await snap("💬 جاري الانتقال إلى صفحة الدردشة...")
-            await page.goto("https://gratisfy.xyz/chat", wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(2)
-            await snap("💬 تم الوصول إلى صفحة الدردشة")
-
-            # تحقق نهائي من الجلسة في /chat
-            still_need_login = False
-            for sel in [
-                'button:has-text("Log in")',
-                'a:has-text("Log in")',
-                '[data-testid="login-button"]',
-                'header button:has-text("Log in")',
-            ]:
-                try:
-                    tmp = page.locator(sel).first
-                    await tmp.wait_for(state="visible", timeout=3000)
-                    still_need_login = True
-                    break
-                except Exception:
-                    continue
-
-            if still_need_login and not login_performed:
-                await snap("⚠️ تسجيل الدخول مطلوب في /chat أيضاً...")
-                # يمكن إضافة محاولة تسجيل إضافية هنا إن لزم الأمر
         else:
             await snap("ℹ️ لا توجد بيانات LOGIN_EMAIL/LOGIN_PASSWORD · بدون تسجيل دخول.")
 
-        # ═══════════════════════════════════════════════════════════════
-        #  🤖 تغيير نموذج المحادثة مباشرة (Grok Uncensored)
-        # ═══════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════
+        #  🤖 تغيير نموذج المحادثة مباشرة
+        # ═══════════════════════════════════════
         if TARGET_MODEL:
             await snap(f"🔽 جاري اختيار النموذج: {TARGET_MODEL}...")
             await asyncio.sleep(1.5)
@@ -383,7 +369,7 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
             if not model_trigger:
                 try:
-                    tmp = page.locator('button', has=re.compile(r"Ling|GPT|Grok|model|اختر|select", re.IGNORECASE)).first
+                    tmp = page.locator('button', has=re.compile(r"Ling|GPT|Grok|model|select", re.IGNORECASE)).first
                     await tmp.wait_for(state="visible", timeout=3000)
                     model_trigger = tmp
                 except Exception:
@@ -396,7 +382,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     await asyncio.sleep(1.5)
                     await page.wait_for_timeout(1000)
 
-                    # البحث في القائمة
                     search_input = None
                     for sel in [
                         'input[placeholder*="Search" i]',
@@ -418,7 +403,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                         await asyncio.sleep(1.0)
                         await snap(f"🔍 تم البحث عن {TARGET_MODEL}")
 
-                        # اختيار النتيجة
                         result_locator = None
                         for sel in [
                             f'text={TARGET_MODEL}',
@@ -489,9 +473,9 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 await page.close()
             except Exception:
                 pass
-        if browser:
+        if browser_ctx:
             try:
-                await browser.close()
+                await browser_ctx.close()
             except Exception:
                 pass
         if pw:
@@ -588,12 +572,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return !uiPatterns.some(p => low.includes(p.toLowerCase())) 
                             && l !== userText 
                             && l.length > 2
-                            && !/^\\d+\\.?\\d*\\s*s?$/.test(l)           // 2.1s
-                            && !/^\\d+\\.?\\d*\\s*tok\\/s?$/.test(l)     // 88.2tok/s
-                            && !/^\\d+\\s*tokens?$/.test(l);             // 10 tokens
+                            && !/^\\d+\\.?\\d*\\s*s?$/.test(l)
+                            && !/^\\d+\\.?\\d*\\s*tok\\/s?$/.test(l)
+                            && !/^\\d+\\s*tokens?$/.test(l);
                     });
                     
-                    // Strategy 1: find user text, return everything after it
                     let userIdx = -1;
                     for(let i = 0; i < clean.length; i++) {
                         if(clean[i] === userText || clean[i].includes(userText) || userText.includes(clean[i])) {
@@ -606,13 +589,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         return clean.slice(userIdx + 1).join('\\n');
                     }
                     
-                    // Strategy 2: return longest meaningful line
                     const long = clean.filter(l => l.length > 15);
                     if(long.length > 0) {
                         return long.sort((a,b) => b.length - a.length)[0];
                     }
                     
-                    // Fallback
                     if(clean.length > 0) return clean[clean.length - 1];
                     return '';
                 }""", [text])
@@ -622,7 +603,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if current_text:
                     if current_text == last_extracted:
                         stable_count += 1
-                        if stable_count >= 3:  # ~6 ثوانٍ استقرار
+                        if stable_count >= 3:
                             response_text = current_text
                             break
                     else:
@@ -633,7 +614,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # ─── إرسال النتيجة للمستخدم ───
             if response_text:
-                # تنظيف نهائي
                 cleaned = re.sub(r'\n?\d+\.?\d*\s*s?\s*\n?', '', response_text)
                 cleaned = re.sub(r'\n?\d+\.?\d*\s*tok/s?\s*\n?', '', cleaned)
                 cleaned = re.sub(r'\n?\d+\s*tokens?\s*\n?', '', cleaned)
