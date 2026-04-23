@@ -3,4 +3,12 @@
 nixPkgs = ["playwright"]
 
 [phases.install]
-cmds = ["playwright install chromium"]
+cmds = [
+    "mkdir -p /app/.playwright-browsers",
+    "export PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-browsers",
+    "playwright install chromium",
+    "playwright install-deps chromium"
+]
+
+[variables]
+PLAYWRIGHT_BROWSERS_PATH = "/app/.playwright-browsers"
