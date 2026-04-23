@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-from io import BytesIO
 from typing import Any, Dict
 
 from telegram import (
@@ -50,12 +49,104 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ البث يعمل بالفعل! أرسل /stop لإيقافه.")
             return
 
-    status_msg = await update.message.reply_text(f"⏳ جاري فتح المتصفح والاتصال بـ {URL} ...")
+    await update.message.reply_text("⏳ جاري تهيئة البث...")
 
+    task = asyncio.create_task(stream_worker(chat_id, context))
+
+    async with streams_lock:
+        streams[chat_id] = {
+            "active": True,
+            "task": task,
+        }
+
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    async with streams_lock:
+        if chat_id not in streams or not streams[chat_id].get("active"):
+            await update.message.reply_text("❌ لا يوجد بث نشط حالياً.")
+            return
+        info = streams[chat_id]
+        info["active"] = False
+        msg_id = info.get("message_id")
+        task = info.get("task")
+
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    if msg_id:
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=msg_id,
+                caption="⏹️ توقف البث المباشر.",
+            )
+        except Exception:
+            pass
+
+    await update.message.reply_text("⏹️ تم إيقاف البث وتصفية المتصفح.")
+
+
+async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """
+    العامل الرئيسي للبث:
+    - يفتح المتصفح ويأخذ لقطة فوراً (صفحة بيضاء/ابتدائية).
+    - يتنقل في الموقع ويُسجّل الدخول خطوة بخطوة.
+    - في كل خطوة: لقطة → إرسال/تحديث → انتظار 3 ثوانٍ.
+    - ثم يدخل في حلقة بث مستمرة كل 3 ثوانٍ.
+    """
     browser = None
     page = None
     pw = None
-    login_performed = False
+    message_id = None
+    tmp_path = f"/tmp/stream_{chat_id}.jpg"
+
+    # ─── دالة مساعدة: لقطة + إرسال/تحديث ───
+    async def snap(caption: str, first: bool = False):
+        nonlocal message_id
+        try:
+            screenshot = await page.screenshot(type="jpeg", quality=80)
+
+            with open(tmp_path, "wb") as f:
+                f.write(screenshot)
+
+            if first or message_id is None:
+                msg = await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=InputFile(tmp_path),
+                    caption=caption,
+                )
+                message_id = msg.message_id
+                async with streams_lock:
+                    if chat_id in streams:
+                        streams[chat_id]["message_id"] = message_id
+            else:
+                await context.bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=InputMediaPhoto(
+                        media=InputFile(tmp_path),
+                        caption=caption,
+                    ),
+                )
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass
+            else:
+                logger.warning(f"BadRequest: {e}")
+        except Exception as e:
+            logger.warning(f"Snap error: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     try:
         pw = await async_playwright().start()
@@ -73,79 +164,94 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         page = await browser.new_page(viewport={"width": 1280, "height": 720})
-        await page.goto(URL, wait_until="networkidle", timeout=60000)
 
         # ═══════════════════════════════════════
-        #  🔐 تسجيل الدخول التلقائي (إن وُجد)
+        #  🎬 البث يبدأ فوراً من هنا
+        # ═══════════════════════════════════════
+
+        # 1) صفحة بيضاء قبل فتح الموقع
+        await snap("🌐 جاري فتح المتصفح...", first=True)
+        await asyncio.sleep(3)
+
+        # 2) الذهاب للموقع
+        await page.goto(URL, wait_until="networkidle", timeout=60000)
+        await snap("🌐 تم الوصول إلى الموقع")
+        await asyncio.sleep(3)
+
+        # 3) إغلاق أي Popup ترحيبي
+        for sel in [
+            "button:has-text('Close')",
+            "[aria-label='Close']",
+            ".popup-close",
+            "button.close",
+        ]:
+            el = await page.query_selector(sel)
+            if el:
+                try:
+                    await el.click()
+                    await page.wait_for_timeout(500)
+                    await snap("🧹 تم إغلاق النافذة المنبثقة")
+                    await asyncio.sleep(3)
+                except Exception:
+                    pass
+
+        # ═══════════════════════════════════════
+        #  🔐 تسجيل الدخول خطوة بخطوة (إن وُجدت البيانات)
         # ═══════════════════════════════════════
         if LOGIN_EMAIL and LOGIN_PASSWORD:
-            try:
-                # إغلاق أي Popup ترحيبي
-                for sel in [
-                    "button:has-text('Close')",
-                    "[aria-label='Close']",
-                    ".popup-close",
-                    "button.close",
-                ]:
-                    el = await page.query_selector(sel)
-                    if el:
-                        try:
-                            await el.click()
-                            await page.wait_for_timeout(300)
-                        except Exception:
-                            pass
+            await snap("🔐 البحث عن زر Log in...")
 
-                # البحث عن زر Log in العلوي
-                login_btn = None
-                for sel in [
-                    'text=Log in',
-                    'button:has-text("Log in")',
-                    'a:has-text("Log in")',
-                    '[data-testid="login-button"]',
-                ]:
-                    login_btn = await page.query_selector(sel)
-                    if login_btn and await login_btn.is_visible():
-                        break
+            login_btn = None
+            for sel in [
+                'text=Log in',
+                'button:has-text("Log in")',
+                'a:has-text("Log in")',
+                '[data-testid="login-button"]',
+            ]:
+                login_btn = await page.query_selector(sel)
+                if login_btn and await login_btn.is_visible():
+                    break
 
-                if not login_btn:
-                    await status_msg.edit_text("ℹ️ لا يوجد زر Log in مرئي، البث سيبدأ مباشرة...")
-                else:
-                    await status_msg.edit_text("🔐 تم العثور على زر Log in، جاري فتح نموذج Sign in...")
-                    await login_btn.click()
+            if login_btn:
+                await login_btn.click()
+                await snap("🔐 تم الضغط على Log in")
+                await asyncio.sleep(3)
 
-                    # انتظار ظهور نموذج Sign in (حقل البريد)
-                    await page.wait_for_selector(
-                        'input[name="email"], input[type="email"]',
-                        timeout=10000,
-                        state="visible",
-                    )
+                # انتظار ظهور حقول النموذج
+                await page.wait_for_selector(
+                    'input[name="email"], input[type="email"]',
+                    timeout=10000,
+                    state="visible",
+                )
 
-                    await status_msg.edit_text("🔐 جاري إدخال البريد وكلمة المرور...")
+                # ملء البريد
+                await snap("📝 جاري كتابة البريد...")
+                await page.fill('input[name="email"], input[type="email"]', LOGIN_EMAIL)
+                await asyncio.sleep(3)
 
-                    # ملء البريد
-                    await page.fill(
-                        'input[name="email"], input[type="email"]',
-                        LOGIN_EMAIL,
-                    )
-                    # ملء كلمة المرور
-                    await page.fill(
-                        'input[name="password"], input[type="password"]',
-                        LOGIN_PASSWORD,
-                    )
+                # ملء الباسورد
+                await snap("📝 جاري كتابة كلمة المرور...")
+                await page.fill('input[name="password"], input[type="password"]', LOGIN_PASSWORD)
+                await asyncio.sleep(3)
 
-                    # ─── الضغط على زر Sign in أو Enter + انتظار الانتقال ───
-                    sign_in_btn = await page.query_selector(
-                        'button:has-text("Sign in"), button[type="submit"]'
-                    )
+                # الضغط على Sign in
+                await snap("🔑 جاري الضغط على Sign in وانتظار الدخول...")
 
-                    if sign_in_btn and await sign_in_btn.is_visible():
-                        await status_msg.edit_text("🔐 جاري الضغط على زر Sign in وانتظار الدخول...")
+                sign_in_btn = await page.query_selector(
+                    'button:has-text("Sign in"), button[type="submit"]'
+                )
+
+                if sign_in_btn and await sign_in_btn.is_visible():
+                    try:
                         async with page.expect_navigation(
                             wait_until="networkidle", timeout=15000
                         ):
                             await sign_in_btn.click()
-                    else:
-                        await status_msg.edit_text("🔐 جاري إرسال النموذج (Enter) وانتظار الدخول...")
+                    except PlaywrightTimeout:
+                        # ربما الموقع SPA (بدون تحميل كامل)، ننتظر قليلاً
+                        await page.wait_for_timeout(3000)
+                else:
+                    try:
                         async with page.expect_navigation(
                             wait_until="networkidle", timeout=15000
                         ):
@@ -153,158 +259,42 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 'input[name="password"], input[type="password"]',
                                 "Enter",
                             )
+                    except PlaywrightTimeout:
+                        await page.wait_for_timeout(3000)
 
-                    # التحقق من نجاح الدخول: حقل الـ email يجب ألا يكون ظاهراً
-                    email_still_visible = await page.is_visible(
-                        'input[name="email"], input[type="email"]'
-                    )
-                    if email_still_visible:
-                        raise RuntimeError(
-                            "ما زال نموذج تسجيل الدخول ظاهراً (بيانات خاطئة؟)"
-                        )
-
-                    login_performed = True
-                    await status_msg.edit_text(
-                        "✅ تم تسجيل الدخول بنجاح وتم الوصول إلى الصفحة! جاري بدء البث..."
-                    )
-
-            except PlaywrightTimeout:
-                logger.warning("انتهى الوقت أثناء محاولة تسجيل الدخول.")
-                await status_msg.edit_text(
-                    "⚠️ انتهى الوقت أثناء تسجيل الدخول، البث سيبدأ بدونه..."
+                # التحقق من نجاح الدخول
+                email_still_visible = await page.is_visible(
+                    'input[name="email"], input[type="email"]'
                 )
-            except Exception as e:
-                logger.warning(f"خطأ أثناء تسجيل الدخول: {e}")
-                await status_msg.edit_text(
-                    f"⚠️ فشل تسجيل الدخول ({e})، سيبدأ البث على أي حال."
-                )
+                if email_still_visible:
+                    await snap("⚠️ بقي نموذج الدخول ظاهراً (بيانات خاطئة؟)، البث مستمر...")
+                else:
+                    await snap("✅ تم تسجيل الدخول! البث المباشر يعمل الآن.")
+                await asyncio.sleep(3)
+
+            else:
+                await snap("ℹ️ لم يُعثر على زر Log in، البث مستمر...")
+                await asyncio.sleep(3)
         else:
-            await status_msg.edit_text(
-                "ℹ️ لم تُضف بيانات LOGIN_EMAIL/LOGIN_PASSWORD، البث بدون تسجيل دخول."
-            )
+            await snap("ℹ️ لا توجد بيانات LOGIN_EMAIL/LOGIN_PASSWORD، البث بدون تسجيل دخول.")
+            await asyncio.sleep(3)
 
-        # ─── أول لقطة بعد تسجيل الدخول (أو بدونه) ───
-        # ننتظر قليلاً لضمان استقرار الصفحة الجديدة
-        await page.wait_for_timeout(500)
-
-        first_screenshot = await page.screenshot(type="jpeg", quality=80)
-
-        sent_msg = await context.bot.send_photo(
-            chat_id=chat_id,
-            photo=InputFile(BytesIO(first_screenshot), filename="live.jpg"),
-            caption="📡 جاري البث المباشر...",
-        )
-
-        # ─── تشغيل حلقة التحديث ───
-        task = asyncio.create_task(
-            broadcast_loop(chat_id, context, page, sent_msg.message_id)
-        )
-
-        async with streams_lock:
-            streams[chat_id] = {
-                "playwright": pw,
-                "browser": browser,
-                "page": page,
-                "message_id": sent_msg.message_id,
-                "active": True,
-                "task": task,
-            }
-
-        if not login_performed:
-            await status_msg.edit_text(
-                "✅ تم بدء البث! 🎥\nسأُحدّث نفس الرسالة كل 3 ثوانٍ."
-            )
-
-    except Exception as e:
-        logger.exception("Error starting stream")
-        try:
-            await status_msg.edit_text(
-                f"❌ فشل بدء البث:\n`{e}`", parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
-
-        # تنظيف فوري إذا فشل البث قبل الاشتغال
-        if page:
-            await page.close()
-        if browser:
-            await browser.close()
-        if pw:
-            await pw.stop()
-
-
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    async with streams_lock:
-        if chat_id not in streams:
-            await update.message.reply_text("❌ لا يوجد بث نشط حالياً.")
-            return
-        info = streams[chat_id]
-        info["active"] = False
-        msg_id = info.get("message_id")
-        task = info.get("task")
-
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    await cleanup_stream(chat_id)
-
-    if msg_id:
-        try:
-            await context.bot.edit_message_caption(
-                chat_id=chat_id,
-                message_id=msg_id,
-                caption="⏹️ توقف البث المباشر.",
-            )
-        except Exception:
-            pass
-
-    await update.message.reply_text("⏹️ تم إيقاف البث وتصفية المتصفح.")
-
-
-# ─── حلقة التحديث ───
-async def broadcast_loop(
-    chat_id: int, context: ContextTypes.DEFAULT_TYPE, page, message_id: int
-):
-    try:
+        # ═══════════════════════════════════════
+        #  📡 الحلقة المستمرة (بث حي)
+        # ═══════════════════════════════════════
         while True:
             async with streams_lock:
                 if chat_id not in streams or not streams[chat_id].get("active"):
                     break
 
-            screenshot = await page.screenshot(type="jpeg", quality=80)
-
-            media = InputMediaPhoto(
-                media=InputFile(BytesIO(screenshot), filename="live.jpg"),
-                caption="📡 لقطة مباشرة · مُحدّثة الآن",
-            )
-
-            try:
-                await context.bot.edit_message_media(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    media=media,
-                )
-            except BadRequest as e:
-                if "Message is not modified" in str(e):
-                    pass
-                else:
-                    logger.warning(f"BadRequest in broadcast: {e}")
-            except Exception as e:
-                logger.warning(f"Broadcast edit error: {e}")
-
+            await snap("📡 لقطة مباشرة · مُحدّثة الآن")
             await asyncio.sleep(3)
 
     except asyncio.CancelledError:
-        logger.info(f"Stream cancelled for {chat_id}")
+        logger.info(f"Stream worker cancelled for {chat_id}")
         raise
     except Exception as e:
-        logger.error(f"Stream loop error: {e}")
+        logger.exception("Stream worker error")
         try:
             await context.bot.send_message(
                 chat_id=chat_id, text=f"⚠️ توقف البث بسبب خطأ: {e}"
@@ -312,33 +302,30 @@ async def broadcast_loop(
         except Exception:
             pass
     finally:
-        await cleanup_stream(chat_id)
-
-
-async def cleanup_stream(chat_id: int):
-    async with streams_lock:
-        data = streams.pop(chat_id, None)
-
-    if not data:
-        return
-
-    try:
-        if data.get("page"):
-            await data["page"].close()
-    except Exception as e:
-        logger.debug(f"Page close error: {e}")
-
-    try:
-        if data.get("browser"):
-            await data["browser"].close()
-    except Exception as e:
-        logger.debug(f"Browser close error: {e}")
-
-    try:
-        if data.get("playwright"):
-            await data["playwright"].stop()
-    except Exception as e:
-        logger.debug(f"Playwright stop error: {e}")
+        # ─── تنظيف Playwright ───
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        # إزالة من الذاكرة
+        async with streams_lock:
+            streams.pop(chat_id, None)
 
 
 def main():
