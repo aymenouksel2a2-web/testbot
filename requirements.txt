@@ -1,4 +1,5 @@
 python-telegram-bot>=20.0
-requests-html
+selenium
+webdriver-manager
 beautifulsoup4
-lxml_html_clean  # مطلوب لـ requests-html لتجنب تحذيرات
+requests
