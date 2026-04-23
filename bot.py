@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import io
+import re
 from typing import Any, Dict
 
 from telegram import (
@@ -27,16 +28,21 @@ RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
 LOGIN_EMAIL = os.environ.get("LOGIN_EMAIL")
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD")
 
-# الفاصل الزمني للبث (تم وضعه كمتغير لتسهيل تغييره)
-STREAM_INTERVAL = 3 
+# ─── اسم النموذج المطلوب (افتراضي: Grok Uncensored) ───
+TARGET_MODEL = os.environ.get("TARGET_MODEL", "Grok Uncensored")
+
+# الفاصل الزمني للبث (ثوانٍ)
+STREAM_INTERVAL = 3
 
 streams: Dict[int, Dict[str, Any]] = {}
 streams_lock = None
+
 
 async def post_init(application: Application) -> None:
     """تهيئة الـ Lock بعد بدء الـ Event Loop لتجنب تحذيرات Python 3.10+"""
     global streams_lock
     streams_lock = asyncio.Lock()
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -45,6 +51,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 /stop  — إيقاف البث\n\n"
         "⚡️ البث يعمل بالذاكرة (RAM) لسرعة أكبر."
     )
+
 
 async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -63,6 +70,7 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "active": True,
             "task": task,
         }
+
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -121,7 +129,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     if chat_id in streams:
                         streams[chat_id]["message_id"] = message_id
             else:
-                # نحتاج لإنشاء BytesIO جديد لكل إرسال لأن المكتبة تقرأ الـ Stream وتغلقه
                 edit_stream = io.BytesIO(screenshot_bytes)
                 await context.bot.edit_message_media(
                     chat_id=chat_id,
@@ -133,7 +140,7 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 )
         except BadRequest as e:
             if "Message is not modified" in str(e):
-                pass # لا مشكلة إذا لم تتغير الصورة
+                pass
             else:
                 logger.warning(f"BadRequest: {e}")
         except Exception as e:
@@ -151,13 +158,13 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 "--disable-setuid-sandbox",
                 "--no-first-run",
                 "--no-zygote",
-                "--single-process" # تقليل استهلاك الرام
+                "--single-process",
             ]
         )
 
         page = await browser.new_page(viewport={"width": 960, "height": 540})
-        
-        # إخفاء خصائص الأتمتة لمنع الحظر من بعض المواقع
+
+        # إخفاء خصائص الأتمتة
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => false
@@ -169,14 +176,12 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         # ═══════════════════════════════════════
 
         await snap("🌐 جاري فتح المتصفح...", first=True)
-        
-        # ملاحظة: استخدمنا domcontentloaded بدلاً من networkidle لأن مواقع الدردشة 
-        # تستخدم WebSockets ولن تصل لحالة networkidle أبداً مما يسبب Timeout
+
         await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         await snap("🌐 تم الوصول إلى الموقع")
         await asyncio.sleep(1.5)
 
-        # إغلاق أي Popup ترحيبي (ننتظر قليلاً لضمان ظهورها)
+        # إغلاق أي Popup ترحيبي
         await page.wait_for_timeout(1500)
         for sel in [
             "button:has-text('Close')",
@@ -201,7 +206,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         if LOGIN_EMAIL and LOGIN_PASSWORD:
             await snap("🔐 البحث عن زر Log in...")
 
-            # ─── البحث عن زر Log in بعدة طرق (fallback) ───
             login_btn = None
             for sel in [
                 'button:has-text("Log in")',
@@ -217,7 +221,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     continue
 
             if not login_btn:
-                # fallback: البحث بالنص العام
                 try:
                     login_btn = page.get_by_text("Log in", exact=False).first
                     await login_btn.wait_for(state="visible", timeout=3000)
@@ -228,7 +231,7 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await login_btn.click()
                     await snap("🔐 تم الضغط على Log in · انتظار نموذج الدخول...")
-                    await asyncio.sleep(2.5) # ننتظر ظهور الـ Modal/النموذج بشكل كامل
+                    await asyncio.sleep(2.5)
                     await page.wait_for_timeout(1000)
 
                     # ─── ملء البريد ───
@@ -277,17 +280,13 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     await pass_input.fill(LOGIN_PASSWORD)
                     await asyncio.sleep(0.5)
 
-                    # ═══════════════════════════════════════════════════
-                    #  🔑 إرسال النموذج (الحل الأساسي: Enter من حقل Password)
-                    # ═══════════════════════════════════════════════════
+                    # ─── إرسال النموذج ───
                     await snap("🔑 جاري إرسال تسجيل الدخول...")
-                    
-                    # الأسلوب الأكثر موثوقية: الضغط على Enter في حقل كلمة المرور
                     await pass_input.press("Enter")
                     await asyncio.sleep(1.0)
                     await page.wait_for_timeout(3000)
-                    
-                    # ─── Fallback: محاولة النقر على زر Submit إن وجد ───
+
+                    # Fallback: النقر على أي زر Sign in/Submit إن وجد
                     try:
                         submit_btn = page.locator('button[type="submit"]').last
                         await submit_btn.wait_for(state="visible", timeout=3000)
@@ -296,7 +295,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
 
-                    # ─── Fallback آخر: أي زر Sign in في الأسفل ───
                     try:
                         sign_in_btn = page.locator('button:has-text("Sign in")').last
                         if await sign_in_btn.is_visible(timeout=2000):
@@ -308,7 +306,7 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     await snap("⏳ التحقق من نجاح تسجيل الدخول...")
                     await page.wait_for_timeout(3000)
 
-                    # ─── التحقق من نجاح الدخول ───
+                    # التحقق من نجاح الدخول (هل بقي زر Log in في الهيدر؟)
                     login_still_visible = False
                     try:
                         hdr_login = page.locator('header').locator('button:has-text("Log in"), a:has-text("Log in")').first
@@ -319,17 +317,16 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     if login_still_visible:
                         await snap("⚠️ بقي زر Log in ظاهراً (بيانات خاطئة؟)، البث مستمر...")
                     else:
-                        await snap("✅ تم تسجيل الدخول! البث المباشر يعمل الآن.")
-                    
+                        await snap("✅ تم تسجيل الدخول!")
                     await asyncio.sleep(1.5)
 
                     # ═══════════════════════════════════════════════════
-                    #  🔄 الانتقال إلى صفحة الدردشة بعد تسجيل الدخول
+                    #  🔄 الانتقال إلى /chat بعد تسجيل الدخول
                     # ═══════════════════════════════════════════════════
                     await snap("💬 جاري الانتقال إلى صفحة الدردشة...")
                     await page.goto("https://gratisfy.xyz/chat", wait_until="domcontentloaded", timeout=60000)
-                    await asyncio.sleep(1.5)
-                    await snap("💬 تم الانتقال إلى صفحة الدردشة · البث مستمر")
+                    await asyncio.sleep(2)
+                    await snap("💬 تم الانتقال إلى صفحة الدردشة")
 
                 except PlaywrightTimeout:
                     await snap("ℹ️ انتهى الوقت أثناء التفاعل مع نموذج الدخول، البث مستمر...")
@@ -337,9 +334,103 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     logger.warning(f"Login flow error: {login_err}")
                     await snap(f"⚠️ خطأ أثناء تسجيل الدخول: {login_err} · البث مستمر...")
             else:
-                await snap("ℹ️ لم يُعثر على زر Log in في الصفحة، البث مستمر...")
+                await snap("ℹ️ لم يُعثر على زر Log in، البث مستمر...")
         else:
             await snap("ℹ️ لا توجد بيانات LOGIN_EMAIL/LOGIN_PASSWORD، البث بدون تسجيل دخول.")
+
+        # ═══════════════════════════════════════════════════════════════
+        #  🤖 تغيير نموذج المحادثة (مثال: Grok Uncensored)
+        # ═══════════════════════════════════════════════════════════════
+        if TARGET_MODEL:
+            await snap(f"🔽 جاري فتح قائمة النماذج لاختيار {TARGET_MODEL}...")
+            await asyncio.sleep(1.5)
+
+            # 1) الضغط على محث اختيار النموذج
+            model_trigger = None
+            for sel in [
+                '[data-testid="model-selector"]',
+                'button[class*="model-selector"]',
+                'button[class*="select-model"]',
+                '[aria-haspopup="listbox"]',
+                'button:has([class*="chevron"])',
+            ]:
+                try:
+                    tmp = page.locator(sel).first
+                    await tmp.wait_for(state="visible", timeout=5000)
+                    model_trigger = tmp
+                    break
+                except Exception:
+                    continue
+
+            if not model_trigger:
+                try:
+                    tmp = page.locator('button', has=re.compile(r"Ling|GPT|Grok|model", re.IGNORECASE)).first
+                    await tmp.wait_for(state="visible", timeout=3000)
+                    model_trigger = tmp
+                except Exception:
+                    model_trigger = None
+
+            if model_trigger:
+                try:
+                    await model_trigger.click()
+                    await snap("🔽 تم فتح قائمة النماذج")
+                    await asyncio.sleep(1.5)
+                    await page.wait_for_timeout(1000)
+
+                    # 2) ملء حقل البحث داخل القائمة
+                    search_input = None
+                    for sel in [
+                        'input[placeholder*="Search" i]',
+                        'input[placeholder*="search" i]',
+                        'input[placeholder*="model" i]',
+                        'input[type="text"]',
+                    ]:
+                        try:
+                            tmp = page.locator(sel).first
+                            await tmp.wait_for(state="visible", timeout=5000)
+                            search_input = tmp
+                            break
+                        except Exception:
+                            continue
+
+                    if search_input:
+                        await search_input.fill(TARGET_MODEL)
+                        await asyncio.sleep(1.0)
+                        await snap(f"🔍 تم البحث عن {TARGET_MODEL}")
+
+                        # 3) اختيار النتيجة
+                        result_locator = None
+                        for sel in [
+                            f'text={TARGET_MODEL}',
+                            f'div:has-text("{TARGET_MODEL}")',
+                            f'li:has-text("{TARGET_MODEL}")',
+                            '[data-testid="model-option"]',
+                            '[role="option"]',
+                        ]:
+                            try:
+                                tmp = page.locator(sel).first
+                                await tmp.wait_for(state="visible", timeout=5000)
+                                result_locator = tmp
+                                break
+                            except Exception:
+                                continue
+
+                        if result_locator:
+                            await result_locator.click()
+                            await snap(f"✅ تم اختيار {TARGET_MODEL}")
+                        else:
+                            await search_input.press("Enter")
+                            await snap(f"⌨️ تم اختيار {TARGET_MODEL} بـ Enter")
+
+                        await asyncio.sleep(1.5)
+                        await page.wait_for_timeout(1500)
+                    else:
+                        await snap("⚠️ لم يُعثر على حقل البحث في قائمة النماذج")
+                except Exception as model_err:
+                    logger.warning(f"Model selection error: {model_err}")
+                    await snap(f"⚠️ خطأ أثناء اختيار النموذج: {model_err}")
+            else:
+                await snap("ℹ️ لم يُعثر على قائمة اختيار النماذج")
 
         # ═══════════════════════════════════════
         #  📡 الحلقة المستمرة (بث حي)
@@ -380,7 +471,7 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 await pw.stop()
             except Exception:
                 pass
-                
+
         # إزالة من الذاكرة
         async with streams_lock:
             streams.pop(chat_id, None)
