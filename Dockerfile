@@ -11,7 +11,6 @@ COPY . .
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 
-# استخدام مستخدم غير root لأمان أكثر (متوفر في صور Playwright الرسمية)
 USER pwuser
 
 CMD ["python", "bot.py"]
