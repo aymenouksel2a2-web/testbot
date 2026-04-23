@@ -1,111 +1,39 @@
-import json
-import aiohttp
+import logging
 import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from playwright.async_api import async_playwright
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# تفعيل السجل Logs لتتبع الأخطاء
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-cookies = None
-headers = None
-
-async def take_screenshot(page, update):
-    screenshot = await page.screenshot(type='png')
-    await update.message.reply_photo(photo=screenshot, caption="📸 Screenshot from gratisfy.xyz")
-
-async def init_browser(update=None):
-    global cookies, headers
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True, 
-            args=["--no-sandbox", "--disable-setuid-sandbox"]
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
-        
-        page = await context.new_page()
-        await page.goto("https://gratisfy.xyz", wait_until="domcontentloaded", timeout=45000)
-        
-        if update:
-            await take_screenshot(page, update)
-        
-        cookies_list = await context.cookies()
-        cookies = {c['name']: c['value'] for c in cookies_list}
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://gratisfy.xyz/",
-            "Origin": "https://gratisfy.xyz",
-            "x-chat-key-source": "server"
-        }
-        
-        await browser.close()
-        print("✅ Browser initialized successfully with cookies")
-        return True
+# جلب التوكن من متغيرات البيئة (سنضيفه لاحقاً في Railway)
+TOKEN = os.environ.get("TOKEN")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 جاري تشغيل المتصفح وتجاوز Cloudflare...\nانتظر السكرين شوت يا زبي")
-    await init_browser(update)
+    """الرد على أمر /start"""
+    await update.message.reply_text("أهلاً بك! 🤖\nأنا بوت يعمل على Railway بنجاح.")
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global cookies, headers
-    if not cookies:
-        await update.message.reply_text("🔄 أول استخدام... جاري تهيئة المتصفح")
-        await init_browser(update)
-
-    user_msg = update.message.text.strip()
-    await update.message.reply_chat_action("typing")
-
-    payload = {
-        "model": "grok-uncensored",
-        "provider": "navy",
-        "messages": [{"role": "user", "content": [{"type": "text", "text": user_msg}]}]
-    }
-
-    full = ""
-    msg = None
-
-    try:
-        async with aiohttp.ClientSession(cookies=cookies) as session:
-            async with session.post("https://gratisfy.xyz/api/chat", json=payload, headers=headers) as resp:
-                if resp.status == 401:
-                    await update.message.reply_text("❌ 401 - جاري إعادة تشغيل المتصفح...")
-                    await init_browser(update)
-                    return
-
-                async for line in resp.content:
-                    line = line.decode('utf-8').strip()
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]": 
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            if chunk.get("choices") and chunk["choices"][0].get("delta", {}).get("content"):
-                                content = chunk["choices"][0]["delta"]["content"]
-                                full += content
-                                if msg is None:
-                                    msg = await update.message.reply_text(full)
-                                else:
-                                    try:
-                                        await msg.edit_text(full)
-                                    except:
-                                        pass
-                        except:
-                            continue
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رد الرسائل النصية"""
+    user_text = update.message.text
+    await update.message.reply_text(f"📩 أرسلت: {user_text}")
 
 def main():
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-    print("🚀 Grok AI Bot v5 Started")
-    app.run_polling()
+    if not TOKEN:
+        raise ValueError("❌ لم يتم العثور على TOKEN! تأكد من إضافته في متغيرات البيئة.")
+
+    # بناء التطبيق
+    application = Application.builder().token(TOKEN).build()
+
+    # إضافة الأوامر
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # تشغيل البوت
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
