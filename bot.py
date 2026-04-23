@@ -1,9 +1,11 @@
+
 import os
 import asyncio
 import logging
 from io import BytesIO
-from telegram import Update, InputFile
+from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.constants import ParseMode
 from playwright.async_api import async_playwright
 
 logging.basicConfig(
@@ -12,15 +14,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── الإعدادات ───
 TOKEN = os.environ.get("BOT_TOKEN")
 URL = "https://gratisfy.xyz/chat"
 PORT = int(os.environ.get("PORT", "8080"))
-
-# Railway يضع اسم النطاق هنا تلقائياً إذا فعّلت Public Domain
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
 
-# تخزين حالة البث
+# تخزين حالة البث: chat_id -> {browser, page, message_id, active}
 streams = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -58,21 +57,33 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = await browser.new_page(viewport={"width": 1280, "height": 720})
         await page.goto(URL, wait_until="networkidle", timeout=60000)
 
+        # ─── أول لقطة لإرسالها كرسالة أولى ───
+        first_screenshot = await page.screenshot(type="jpeg", quality=80)
+
+        # إرسال الصورة الأولى وحفظ message_id
+        sent_msg = await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=InputFile(BytesIO(first_screenshot), filename="live.jpg"),
+            caption="📡 جاري البث المباشر...",
+        )
+
         streams[chat_id] = {
             "playwright": p,
             "browser": browser,
             "page": page,
+            "message_id": sent_msg.message_id,
             "active": True,
         }
 
-        await update.message.reply_text("✅ تم بدء البث! 🎥\nسأرسل لقطة كل 3 ثوانٍ.")
+        await update.message.reply_text("✅ تم بدء البث! 🎥\nسأُحدّث نفس الرسالة كل 3 ثوانٍ.")
 
+        # تشغيل حلقة التحديث
         task = asyncio.create_task(broadcast_loop(chat_id, context))
         streams[chat_id]["task"] = task
 
     except Exception as e:
         logger.exception("Error starting stream")
-        await update.message.reply_text(f"❌ فشل بدء البث:\n`{e}`", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ فشل بدء البث:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -90,19 +101,44 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
+    msg_id = streams[chat_id].get("message_id")
     await cleanup_stream(chat_id)
+
+    # تعديل الرسالة الأخيرة لتظهر أن البث توقف
+    if msg_id:
+        try:
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=msg_id,
+                caption="⏹️ توقف البث المباشر.",
+            )
+        except Exception:
+            pass
+
     await update.message.reply_text("⏹️ تم إيقاف البث وتصفية المتصفح.")
 
+# ─── حلقة التحديث: تُعدّل نفس الرسالة ───
 async def broadcast_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
         while streams.get(chat_id, {}).get("active", False):
             page = streams[chat_id]["page"]
+            msg_id = streams[chat_id]["message_id"]
+
+            # التقاط لقطة جديدة
             screenshot = await page.screenshot(type="jpeg", quality=80)
 
-            await context.bot.send_photo(
+            # تحديث نفس الرسالة بصورة جديدة
+            await context.bot.edit_message_media(
                 chat_id=chat_id,
-                photo=InputFile(BytesIO(screenshot), filename="live.jpg"),
-                caption="📡 لقطة مباشرة"
+                message_id=msg_id,
+                media=InputFile(BytesIO(screenshot), filename="live.jpg"),
+            )
+
+            # تحديث الوقت في الكابشن (اختياري)
+            await context.bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=msg_id,
+                caption="📡 لقطة مباشرة · مُحدّثة الآن",
             )
 
             await asyncio.sleep(3)
@@ -111,7 +147,7 @@ async def broadcast_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Stream cancelled for {chat_id}")
     except Exception as e:
         logger.error(f"Stream error: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ توقف البث: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ توقف البث بسبب خطأ: {e}")
     finally:
         await cleanup_stream(chat_id)
 
@@ -139,7 +175,6 @@ def main():
     app.add_handler(CommandHandler("stream", stream))
     app.add_handler(CommandHandler("stop", stop))
 
-    # ─── Webhook mode (مطلوب على Railway) ───
     if RAILWAY_DOMAIN:
         secret_path = TOKEN.split(":")[-1]
         webhook_url = f"https://{RAILWAY_DOMAIN}/{secret_path}"
@@ -153,7 +188,6 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        # احتياطي محلي فقط
         logger.warning("⚠️ RAILWAY_PUBLIC_DOMAIN غير موجود! سيعمل بالـ Polling.")
         app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
