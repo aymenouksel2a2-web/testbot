@@ -7,24 +7,15 @@ import re
 from datetime import timedelta
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-
-if not BOT_TOKEN:
-    print("خطأ: لم يتم العثور على BOT_TOKEN.")
-    exit()
-
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# قاموس لتتبع العمليات النشطة
 active_tasks = {}
 
-# دالة لإنشاء شريط التقدم المرئي
 def create_progress_bar(percentage):
     filled = int(percentage / 10)
     if filled > 10: filled = 10
-    bar = '█' * filled + '░' * (10 - filled)
-    return bar
+    return '█' * filled + '░' * (10 - filled)
 
-# الدالة المسؤولة عن الفحص المتسلسل (الصيد)
 def hunt_labs(chat_id, start_id, end_id):
     active_tasks[chat_id] = True
     total_to_scan = (end_id - start_id) + 1
@@ -33,80 +24,68 @@ def hunt_labs(chat_id, start_id, end_id):
     start_time = time.time()
     last_dashboard_update = time.time()
     
-    # رسالة لوحة التحكم المبدئية
-    dashboard_msg = bot.send_message(chat_id, "⏳ جاري تهيئة لوحة تحكم الصيد...")
+    dashboard_msg = bot.send_message(chat_id, "⏳ جاري بدء عملية الصيد الذكي...")
     
     try:
         with sync_playwright() as p:
-            # تشغيل المتصفح في وضع مخفي
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             
             for lab_id in range(start_id, end_id + 1):
-                if not active_tasks.get(chat_id):
-                    break 
+                if not active_tasks.get(chat_id): break 
                 
-                # تنظيف الذاكرة كل 100 رابط لمنع الانهيار
                 if scanned_count > 0 and scanned_count % 100 == 0:
-                    try:
-                        page.close()
-                    except:
-                        pass
+                    page.close()
                     page = browser.new_page()
                 
-                # تحويل الرقم إلى صيغة 5 أرقام
                 lab_id_str = f"{lab_id:05d}"
-                
-                # --- إصلاح الرابط النهائي ---
-                # تأكد أن الرابط نصي خالص بدون أي علامات ماركداون
+                # الرابط النصي الصحيح بدون أي تنسيقات إضافية
                 url = f"[https://www.skills.google/focuses/](https://www.skills.google/focuses/){lab_id_str}?parent=catalog"
                 
                 scanned_count += 1
                 
                 try:
-                    # الدخول للرابط والانتظار حتى استقرار المحتوى
-                    response = page.goto(url, timeout=25000, wait_until="domcontentloaded") 
+                    # الدخول للرابط مع انتظار تحميل المحتوى
+                    page.goto(url, timeout=20000, wait_until="domcontentloaded")
                     
-                    # التحقق من أن الصفحة موجودة وليست خطأ 404
-                    if response and response.status == 200:
-                        # انتظار بسيط لضمان تحميل الـ JavaScript الخاص بالوقت
-                        time.sleep(2.5) 
-                        
-                        js_code = """
-                        () => {
-                            let titleEl = document.querySelector('h1');
-                            let title = titleEl ? titleEl.innerText.trim() : "بدون عنوان";
-                            let allText = document.documentElement.innerText || document.body.textContent;
-                            // البحث عن صيغة الوقت 00:00:00
-                            let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
-                            if (match) {
-                                return { time: match[0], title: title };
-                            }
-                            return null;
+                    # الحل النهائي: التحقق من الرابط الحالي بعد التحميل
+                    # إذا قام الموقع بتحويلك للصفحة الرئيسية، فهذا المختبر غير موجود
+                    current_url = page.url
+                    if "/focuses/" not in current_url or lab_id_str not in current_url:
+                        continue # تخطي هذا الرقم لأنه غير موجود
+                    
+                    # إذا وصلنا هنا، فهذا يعني أن الصفحة موجودة فعلاً
+                    time.sleep(2.5) 
+                    
+                    js_code = """
+                    () => {
+                        let titleEl = document.querySelector('h1');
+                        let title = titleEl ? titleEl.innerText.trim() : "بدون عنوان";
+                        let allText = document.documentElement.innerText || document.body.textContent;
+                        let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
+                        if (match) {
+                            return { time: match[0], title: title };
                         }
-                        """
-                        result = page.evaluate(js_code)
-                        
-                        if result and result.get('time'):
-                            found_count += 1
-                            lab_time = result['time']
-                            lab_title = result['title']
-                            
-                            found_msg = (
-                                f"🎯 مختبر جديد!\n\n"
-                                f"📌 الرقم: `{lab_id_str}`\n"
-                                f"🏷️ العنوان: {lab_title}\n"
-                                f"⏳ الوقت: `{lab_time}`\n"
-                                f"🔗 الرابط: {url}"
-                            )
-                            bot.send_message(chat_id, found_msg, disable_web_page_preview=True)
+                        return null;
+                    }
+                    """
+                    result = page.evaluate(js_code)
+                    
+                    if result and result.get('time'):
+                        found_count += 1
+                        found_msg = (
+                            f"🎯 مختبر جديد!\n\n"
+                            f"📌 الرقم: `{lab_id_str}`\n"
+                            f"🏷️ العنوان: {result['title']}\n"
+                            f"⏳ الوقت: `{result['time']}`\n"
+                            f"🔗 الرابط: {url}"
+                        )
+                        bot.send_message(chat_id, found_msg, disable_web_page_preview=True)
                             
                 except Exception:
-                    # في حال فشل الرابط ننتظر قليلاً لتجنب الضغط على المعالج
-                    time.sleep(0.2)
-                    pass
+                    continue
                 
-                # تحديث لوحة التحكم كل 15 ثانية لتجنب حظر تيليجرام
+                # تحديث لوحة التحكم كل 15 ثانية
                 current_time = time.time()
                 if (current_time - last_dashboard_update > 15) or scanned_count == total_to_scan:
                     percentage = (scanned_count / total_to_scan) * 100
@@ -115,74 +94,41 @@ def hunt_labs(chat_id, start_id, end_id):
                     remaining_scans = total_to_scan - scanned_count
                     eta_seconds = max(0, remaining_scans * avg_time_per_scan)
                     
-                    eta_str = str(timedelta(seconds=int(eta_seconds)))
-                    progress_bar = create_progress_bar(percentage)
-                    
                     dashboard_text = (
                         f"📊 لوحة تحكم الصيد\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
-                        f"🔄 التقدم: |{progress_bar}| {percentage:.1f}%\n"
+                        f"🔄 التقدم: |{create_progress_bar(percentage)}| {percentage:.1f}%\n"
                         f"⚡ فحص: {scanned_count}/{total_to_scan}\n"
                         f"🎯 تم العثور على: {found_count} مختبر\n"
-                        f"⏳ المتبقي: {eta_str}\n"
+                        f"⏳ المتبقي: {str(timedelta(seconds=int(eta_seconds)))}\n"
                         f"━━━━━━━━━━━━━━━━━━\n"
                         f"📡 الحالة: يعمل بأمان | 👤 كحساب مسجل"
                     )
-                    
                     try:
                         bot.edit_message_text(chat_id=chat_id, message_id=dashboard_msg.message_id, text=dashboard_text)
                         last_dashboard_update = current_time
-                    except:
-                        pass
+                    except: pass
             
             browser.close()
-            
-    except Exception as e:
-        bot.send_message(chat_id, "❌ حدث خطأ في النظام.")
+    except Exception:
+        bot.send_message(chat_id, "❌ خطأ في النظام.")
     finally:
         active_tasks[chat_id] = False
-        bot.send_message(chat_id, "🛑 انتهت عملية الصيد بنجاح!")
+        bot.send_message(chat_id, "🛑 انتهت العملية.")
 
-# الأوامر الأساسية
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_text = (
-        "مرحباً بك في بوت 🕵️‍♂️ Super Links Hunter!\n\n"
-        "وضعية البحث الحالية: متصل بحسابك 👤\n\n"
-        "للأوامر المتاحة:\n"
-        "🔹 `/hunt 00000 99999` : للبحث عن المختبرات من وإلى.\n"
-        "🔹 `/stop` : لإيقاف البحث."
-    )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+@bot.message_handler(commands=['start'])
+def start(m):
+    bot.reply_to(m, "أرسل `/hunt 00000 99999` للبدء.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['stop'])
-def stop_scan(message):
-    chat_id = message.chat.id
-    if active_tasks.get(chat_id):
-        active_tasks[chat_id] = False 
-        bot.reply_to(message, "⏳ جاري إيقاف عملية الصيد...")
-    else:
-        bot.reply_to(message, "لا توجد عملية صيد نشطة حالياً.")
+def stop(m):
+    active_tasks[m.chat.id] = False
+    bot.reply_to(m, "جاري الإيقاف...")
 
 @bot.message_handler(commands=['hunt'])
-def handle_hunt(message):
-    chat_id = message.chat.id
-    if active_tasks.get(chat_id):
-        bot.reply_to(message, "⚠️ هناك عملية صيد نشطة حالياً.")
-        return
-        
-    parts = message.text.split()
-    start_id, end_id = 0, 99999
-    
-    if len(parts) == 3:
-        try:
-            start_id, end_id = int(parts[1]), int(parts[2])
-        except ValueError:
-            bot.reply_to(message, "⚠️ يرجى إدخال أرقام صحيحة.")
-            return
-            
-    thread = threading.Thread(target=hunt_labs, args=(chat_id, start_id, end_id))
-    thread.start()
+def handle_hunt(m):
+    p = m.text.split()
+    if len(p) == 3:
+        threading.Thread(target=hunt_labs, args=(m.chat.id, int(p[1]), int(p[2]))).start()
 
-if __name__ == "__main__":
-    bot.infinity_polling()
+bot.infinity_polling()
