@@ -46,7 +46,7 @@ def hunt_labs(chat_id, start_id, end_id):
                 if not active_tasks.get(chat_id):
                     break 
                 
-                # تنظيف الذاكرة كل 100 رابط
+                # تنظيف الذاكرة كل 100 رابط لمنع الانهيار
                 if scanned_count > 0 and scanned_count % 100 == 0:
                     try:
                         page.close()
@@ -56,24 +56,28 @@ def hunt_labs(chat_id, start_id, end_id):
                 
                 # تحويل الرقم إلى صيغة 5 أرقام
                 lab_id_str = f"{lab_id:05d}"
-                # تصحيح الرابط: إزالة أي تنسيق ماركداون لكي يقرأه البايثون كـ URL سليم
+                
+                # --- إصلاح الرابط النهائي ---
+                # تأكد أن الرابط نصي خالص بدون أي علامات ماركداون
                 url = f"[https://www.skills.google/focuses/](https://www.skills.google/focuses/){lab_id_str}?parent=catalog"
                 
                 scanned_count += 1
                 
                 try:
-                    # الدخول للرابط
-                    response = page.goto(url, timeout=20000, wait_until="domcontentloaded") 
+                    # الدخول للرابط والانتظار حتى استقرار المحتوى
+                    response = page.goto(url, timeout=25000, wait_until="domcontentloaded") 
                     
-                    # إذا كانت الصفحة موجودة (ليست 404)
+                    # التحقق من أن الصفحة موجودة وليست خطأ 404
                     if response and response.status == 200:
-                        time.sleep(2) 
+                        # انتظار بسيط لضمان تحميل الـ JavaScript الخاص بالوقت
+                        time.sleep(2.5) 
                         
                         js_code = """
                         () => {
                             let titleEl = document.querySelector('h1');
                             let title = titleEl ? titleEl.innerText.trim() : "بدون عنوان";
                             let allText = document.documentElement.innerText || document.body.textContent;
+                            // البحث عن صيغة الوقت 00:00:00
                             let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
                             if (match) {
                                 return { time: match[0], title: title };
@@ -93,16 +97,16 @@ def hunt_labs(chat_id, start_id, end_id):
                                 f"📌 الرقم: `{lab_id_str}`\n"
                                 f"🏷️ العنوان: {lab_title}\n"
                                 f"⏳ الوقت: `{lab_time}`\n"
-                                f"🔗 الرابط: [اضغط هنا للدخول]({url})"
+                                f"🔗 الرابط: {url}"
                             )
-                            bot.send_message(chat_id, found_msg, parse_mode="Markdown", disable_web_page_preview=True)
+                            bot.send_message(chat_id, found_msg, disable_web_page_preview=True)
                             
                 except Exception:
-                    # في حال فشل الاتصال أو التايم أوت، ننتظر قليلاً ثم نكمل
-                    time.sleep(0.5)
+                    # في حال فشل الرابط ننتظر قليلاً لتجنب الضغط على المعالج
+                    time.sleep(0.2)
                     pass
                 
-                # تحديث لوحة التحكم كل 15 ثانية
+                # تحديث لوحة التحكم كل 15 ثانية لتجنب حظر تيليجرام
                 current_time = time.time()
                 if (current_time - last_dashboard_update > 15) or scanned_count == total_to_scan:
                     percentage = (scanned_count / total_to_scan) * 100
@@ -134,7 +138,7 @@ def hunt_labs(chat_id, start_id, end_id):
             browser.close()
             
     except Exception as e:
-        bot.send_message(chat_id, f"❌ حدث خطأ في النظام.")
+        bot.send_message(chat_id, "❌ حدث خطأ في النظام.")
     finally:
         active_tasks[chat_id] = False
         bot.send_message(chat_id, "🛑 انتهت عملية الصيد بنجاح!")
