@@ -3,12 +3,9 @@ import asyncio
 import logging
 import io
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from telegram import (
-    Update,
-    InputMediaPhoto,
-)
+from telegram import Update, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,79 +22,356 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ═══════════════════════════════════════════════════════════════
+#  إعدادات البيئة
+# ═══════════════════════════════════════════════════════════════
+
 TOKEN = os.environ.get("BOT_TOKEN")
 URL = "https://gratisfy.xyz/chat"
 PORT = int(os.environ.get("PORT", "8080"))
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
 
-# ─── بيانات تسجيل الدخول من متغيرات Railway ───
 LOGIN_EMAIL = os.environ.get("LOGIN_EMAIL")
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD")
-
-# ─── اسم النموذج المطلوب (افتراضي: Grok Uncensored) ───
 TARGET_MODEL = os.environ.get("TARGET_MODEL", "Grok Uncensored")
 
-# الفاصل الزمني للبث (ثوانٍ)
 STREAM_INTERVAL = 3
+PERSISTENT_DIR = "/tmp/gratisfy-data"
 
-# مجلد حفظ بيانات المتصفح المستمرة (cookies, localStorage...)
-PERSISTENT_DATA_DIR = "/tmp/gratisfy-data"
+# ═══════════════════════════════════════════════════════════════
+#  بنية البيانات
+# ═══════════════════════════════════════════════════════════════
 
 streams: Dict[int, Dict[str, Any]] = {}
-streams_lock = None
+streams_lock: Optional[asyncio.Lock] = None
 
 
-async def post_init(application: Application) -> None:
-    """تهيئة الـ Lock بعد بدء الـ Event Loop"""
+async def post_init(app: Application) -> None:
     global streams_lock
     streams_lock = asyncio.Lock()
+    logger.info("✅ Bot initialized")
 
+
+# ═══════════════════════════════════════════════════════════════
+#  Helpers (دوال مساعدة احترافية)
+# ═══════════════════════════════════════════════════════════════
+
+async def snap(
+    page: Any,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    caption: str,
+    first: bool = False,
+):
+    """يلتقط لقطة شاشة ويُحدّث الرسالة المصوّرة في نفس الرسالة"""
+    try:
+        screenshot = await page.screenshot(type="jpeg", quality=60)
+        photo = io.BytesIO(screenshot)
+        photo.name = "stream.jpg"
+
+        async with streams_lock:
+            session = streams.get(chat_id)
+            if not session:
+                return
+            msg_id = session.get("message_id")
+
+        if first or msg_id is None:
+            sent = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=caption,
+            )
+            async with streams_lock:
+                if chat_id in streams:
+                    streams[chat_id]["message_id"] = sent.message_id
+        else:
+            edit = io.BytesIO(screenshot)
+            await context.bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=msg_id,
+                media=InputMediaPhoto(media=edit, caption=caption),
+            )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"[snap] BadRequest: {e}")
+    except Exception as e:
+        logger.warning(f"[snap] Error: {e}")
+
+
+async def is_login_visible(page) -> bool:
+    """يتحقق هل زر Log in ظاهر في الصفحة حالياً"""
+    selectors = [
+        'button:has-text("Log in")',
+        'a:has-text("Log in")',
+        '[data-testid="login-button"]',
+        'header button:has-text("Log in")',
+        'header a:has-text("Log in")',
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=2500)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def perform_login(page):
+    """ينفّذ تسجيل الدخول كاملاً (يفترض أن الزر ظاهر)"""
+    login_btn = page.locator(
+        'button:has-text("Log in"), a:has-text("Log in")'
+    ).first
+    await login_btn.wait_for(state="visible", timeout=5000)
+    await login_btn.click()
+    await asyncio.sleep(2.5)
+
+    # ── إدخال البريد ──
+    email_in = None
+    for sel in [
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[id="email"]',
+        'input[placeholder*="email" i]',
+    ]:
+        try:
+            email_in = page.locator(sel).first
+            await email_in.wait_for(state="visible", timeout=8000)
+            break
+        except Exception:
+            continue
+    if not email_in:
+        raise Exception("لم يُعثر على حقل البريد")
+
+    await email_in.fill(LOGIN_EMAIL)
+    await asyncio.sleep(0.4)
+
+    # ── إدخال كلمة المرور ──
+    pass_in = None
+    for sel in [
+        'input[name="password"]',
+        'input[type="password"]',
+        'input[id="password"]',
+        'input[placeholder*="password" i]',
+    ]:
+        try:
+            pass_in = page.locator(sel).first
+            await pass_in.wait_for(state="visible", timeout=8000)
+            break
+        except Exception:
+            continue
+    if not pass_in:
+        raise Exception("لم يُعثر على حقل كلمة المرور")
+
+    await pass_in.fill(LOGIN_PASSWORD)
+    await asyncio.sleep(0.4)
+
+    # ── إرسال ──
+    await pass_in.press("Enter")
+    await asyncio.sleep(1.0)
+
+    # Fallback submit buttons
+    for btn_text in ["Submit", "Sign in", "Login", "Continue"]:
+        try:
+            btn = page.locator(f'button:has-text("{btn_text}")').last
+            await btn.wait_for(state="visible", timeout=2000)
+            await btn.click(timeout=3000)
+            await asyncio.sleep(1.5)
+        except Exception:
+            pass
+
+    await asyncio.sleep(3)
+
+
+async def select_model(page, model_name: str) -> bool:
+    """يختار النموذج من القائمة المنسدلة"""
+    trigger = None
+    for sel in [
+        '[data-testid="model-selector"]',
+        'button[class*="model-selector"]',
+        '[aria-haspopup="listbox"]',
+        'button:has([class*="chevron"])',
+    ]:
+        try:
+            trigger = page.locator(sel).first
+            await trigger.wait_for(state="visible", timeout=5000)
+            break
+        except Exception:
+            continue
+
+    if not trigger:
+        try:
+            trigger = page.locator(
+                "button", has=re.compile(r"Grok|model", re.IGNORECASE)
+            ).first
+            await trigger.wait_for(state="visible", timeout=3000)
+        except Exception:
+            return False
+
+    await trigger.click()
+    await asyncio.sleep(1.5)
+
+    # حقل البحث
+    search_in = None
+    for sel in [
+        'input[placeholder*="Search" i]',
+        'input[type="text"]',
+        '[role="searchbox"]',
+    ]:
+        try:
+            search_in = page.locator(sel).first
+            await search_in.wait_for(state="visible", timeout=5000)
+            break
+        except Exception:
+            continue
+
+    if not search_in:
+        return False
+
+    await search_in.fill(model_name)
+    await asyncio.sleep(1.0)
+
+    # اختيار النتيجة
+    result = None
+    for sel in [
+        f"text={model_name}",
+        f'li:has-text("{model_name}")',
+        '[role="option"]',
+        f'button:has-text("{model_name}")',
+    ]:
+        try:
+            result = page.locator(sel).first
+            await result.wait_for(state="visible", timeout=5000)
+            break
+        except Exception:
+            continue
+
+    if result:
+        await result.click()
+    else:
+        await search_in.press("Enter")
+
+    await asyncio.sleep(1.5)
+    return True
+
+
+async def extract_response(page, user_text: str, timeout_sec: int = 120) -> str:
+    """يستخرج رد البوت باستخدام innerText مع فلترة UI قوية"""
+    start = asyncio.get_event_loop().time()
+    last_text = ""
+    stable = 0
+
+    while (asyncio.get_event_loop().time() - start) < timeout_sec:
+        js_result = await page.evaluate(
+            """(u) => {
+                const raw = document.body.innerText || '';
+                const lines = raw.split('\\n').map(l => l.trim()).filter(Boolean);
+                
+                const junk = [
+                    'Enter to send','Shift + Enter','Ctrl/Cmd + V','paste attachment',
+                    'attach file','record','Message Grok','Start a conversation',
+                    'Select a model','Settings','Gratisfy','to send','for new line',
+                    'Send message','Attach','Paperclip','Mic','new line',
+                    'tokens','tok/s','Thinking','Stop generating','Regenerate',
+                    'Copy','Like','Dislike','Share','Export','Web search','Reason'
+                ];
+                
+                const clean = lines.filter(l => {
+                    const low = l.toLowerCase();
+                    return l.length > 2 
+                        && l !== u 
+                        && !junk.some(j => low.includes(j.toLowerCase()))
+                        && !/^\\d+\\.?\\d*\\s*s?$/.test(l)
+                        && !/^\\d+\\.?\\d*\\s*tok\\/s?$/.test(l)
+                        && !/^\\d+\\s*tokens?$/.test(l);
+                });
+                
+                // أجد مؤشر رسالة المستخدم
+                let idx = -1;
+                for(let i=0; i<clean.length; i++){
+                    if(clean[i]===u || clean[i].includes(u) || u.includes(clean[i])){
+                        idx = i;
+                        break;
+                    }
+                }
+                
+                if(idx >= 0 && idx < clean.length - 1){
+                    return clean.slice(idx + 1).join('\\n');
+                }
+                
+                const long = clean.filter(l => l.length > 15);
+                if(long.length) return long.sort((a,b) => b.length - a.length)[0];
+                
+                return clean.length ? clean[clean.length - 1] : '';
+            }""",
+            [user_text],
+        )
+
+        current = (js_result or "").strip()
+        if current:
+            if current == last_text:
+                stable += 1
+                if stable >= 3:  # استقرار لـ 6 ثوانٍ تقريباً
+                    return current
+            else:
+                stable = 0
+                last_text = current
+
+        await asyncio.sleep(2)
+
+    return last_text
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Handlers
+# ═══════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 بوت Gratisfy — وضع البث المباشر + دردشة نصية\n\n"
-        "📌 /stream — بدء جلسة جديدة (يفتح المتصفح ويبث الشاشة)\n"
-        "📌 /stop  — إيقاف الجلسة وإغلاق المتصفح\n\n"
-        "⚡️ بمجرد بدء البث، أرسل أي رسالة وسأرد عليك بالنص مباشرة."
+        "🤖 *Gratisfy Ultra* — بث مباشر + دردشة نصية\n\n"
+        "📌 /stream — بدء جلسة جديدة (متصفح مستمر)\n"
+        "📌 /stop  — إيقاف الجلسة\n\n"
+        "⚡️ أرسل أي رسالة بعد بدء البث للحصول على رد نصي فوري.",
+        parse_mode="Markdown",
     )
 
-
-# ═══════════════════════════════════════════════════════════════
-#  📡 أوامر البث المباشر (صورة تُحدّث كل 3 ثواني)
-# ═══════════════════════════════════════════════════════════════
 
 async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     async with streams_lock:
         if chat_id in streams and streams[chat_id].get("active"):
-            await update.message.reply_text("⚠️ البث يعمل بالفعل! أرسل /stop لإيقافه.")
+            await update.message.reply_text(
+                "⚠️ هناك بث نشط بالفعل! أرسل /stop لإيقافه أولاً."
+            )
             return
 
-    await update.message.reply_text("⏳ جاري تهيئة المتصفح والبث...")
-
-    task = asyncio.create_task(stream_worker(chat_id, context))
-
-    async with streams_lock:
         streams[chat_id] = {
             "active": True,
-            "task": task,
+            "ready": False,
             "page": None,
             "lock": asyncio.Lock(),
             "message_id": None,
+            "task": None,
         }
+
+    await update.message.reply_text("⏳ جاري تهيئة المتصفح المستمر...")
+    task = asyncio.create_task(stream_worker(chat_id, context))
+
+    async with streams_lock:
+        streams[chat_id]["task"] = task
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     async with streams_lock:
-        if chat_id not in streams or not streams[chat_id].get("active"):
+        session = streams.get(chat_id)
+        if not session or not session.get("active"):
             await update.message.reply_text("❌ لا يوجد بث نشط حالياً.")
             return
-        info = streams[chat_id]
-        info["active"] = False
-        task = info.get("task")
+        session["active"] = False
+        task = session.get("task")
 
     if task and not task.done():
         task.cancel()
@@ -106,57 +380,109 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
-    await update.message.reply_text("⏹️ تم إيقاف البث وتصفية المتصفح.")
+    await update.message.reply_text("⏹️ تم إيقاف البث وإغلاق المتصفح.")
 
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يستقبل الرسائل أثناء البث النشط ويرد بالنص"""
+    chat_id = update.effective_chat.id
+    text = update.message.text
+
+    async with streams_lock:
+        session = streams.get(chat_id)
+        if not session or not session.get("active") or not session.get("ready"):
+            return
+        lock = session.get("lock")
+        page = session.get("page")
+
+    if not lock or not page:
+        return
+
+    async with lock:
+        status_msg = None
+        try:
+            status_msg = await update.message.reply_text("⏳ جاري إرسال السؤال...")
+
+            # إيجاد textarea
+            textarea = None
+            for sel in [
+                'textarea[placeholder*="Message" i]',
+                'textarea[class*="chat-input"]',
+                'textarea',
+                'div[contenteditable="true"]',
+            ]:
+                try:
+                    textarea = page.locator(sel).first
+                    await textarea.wait_for(state="visible", timeout=5000)
+                    break
+                except Exception:
+                    continue
+
+            if not textarea:
+                await status_msg.edit_text("❌ لم أجد حقل الكتابة في الموقع.")
+                return
+
+            await textarea.fill(text)
+            await asyncio.sleep(0.3)
+            await textarea.press("Enter")
+
+            await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد...")
+
+            # ── استخراج الرد ──
+            response = await extract_response(page, text, timeout_sec=120)
+
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+            if not response:
+                await update.message.reply_text(
+                    "⚠️ لم أتمكن من استخراج رد نصي من الموقع."
+                )
+                return
+
+            # تنظيف نهائي
+            cleaned = re.sub(r"\n?\d+\.?\d*\s*s?\s*\n?", "\n", response)
+            cleaned = re.sub(r"\n?\d+\.?\d*\s*tok/s?\s*\n?", "\n", cleaned)
+            cleaned = re.sub(r"\n?\d+\s*tokens?\s*\n?", "\n", cleaned)
+            cleaned = cleaned.strip()
+
+            # إرسال للمستخدم
+            max_len = 4000
+            if len(cleaned) <= max_len:
+                await update.message.reply_text(cleaned)
+            else:
+                parts = [cleaned[i : i + max_len] for i in range(0, len(cleaned), max_len)]
+                for part in parts:
+                    await update.message.reply_text(part)
+
+        except Exception as e:
+            logger.exception("[handle_message] Error")
+            if status_msg:
+                try:
+                    await status_msg.edit_text(f"⚠️ خطأ: {str(e)[:200]}")
+                except Exception:
+                    pass
+            else:
+                await update.message.reply_text(f"⚠️ خطأ: {str(e)[:200]}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Stream Worker (المحرك الرئيسي)
+# ═══════════════════════════════════════════════════════════════
 
 async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    browser_ctx = None
     pw = None
+    browser_ctx = None
     page = None
-    message_id = None
-
-    # ─── دالة مساعدة: لقطة + إرسال/تحديث (بدون حفظ على القرص) ───
-    async def snap(caption: str, first: bool = False):
-        nonlocal message_id
-        try:
-            screenshot_bytes = await page.screenshot(type="jpeg", quality=60)
-            photo_stream = io.BytesIO(screenshot_bytes)
-            photo_stream.name = "stream.jpg"
-
-            if first or message_id is None:
-                msg = await context.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=photo_stream,
-                    caption=caption,
-                )
-                message_id = msg.message_id
-                async with streams_lock:
-                    if chat_id in streams:
-                        streams[chat_id]["message_id"] = message_id
-            else:
-                edit_stream = io.BytesIO(screenshot_bytes)
-                await context.bot.edit_message_media(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    media=InputMediaPhoto(
-                        media=edit_stream,
-                        caption=caption,
-                    ),
-                )
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                pass
-            else:
-                logger.warning(f"BadRequest: {e}")
-        except Exception as e:
-            logger.warning(f"Snap error: {e}")
 
     try:
         pw = await async_playwright().start()
 
-        # ─── استخدام متصفح مستمر (يحفظ cookies و localStorage) ───
+        # ━━ متصفح مستمر (يحفظ الجلسة إلى الأبد) ━━
         browser_ctx = await pw.chromium.launch_persistent_context(
-            PERSISTENT_DATA_DIR,
+            PERSISTENT_DIR,
             headless=True,
             args=[
                 "--no-sandbox",
@@ -168,306 +494,99 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 "--single-process",
             ],
             viewport={"width": 960, "height": 540},
+            locale="en-US",
         )
 
         page = await browser_ctx.new_page()
 
-        # إخفاء خصائص الأتمتة
+        # إخفاء automation
         await page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
+            window.chrome = { runtime: {} };
         """)
 
-        # ═══════════════════════════════════════
-        #  🎬 البث يبدأ فوراً من هنا
-        # ═══════════════════════════════════════
-        await snap("🌐 جاري فتح المتصفح...", first=True)
+        # ━━ فتح الموقع ━━
+        await snap(page, context, chat_id, "🌐 جاري فتح المتصفح...", first=True)
         await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-        await snap("🌐 تم الوصول إلى الموقع")
+        await snap(page, context, chat_id, "🌐 تم الوصول إلى الموقع")
         await asyncio.sleep(1.5)
 
-        # إغلاق أي Popup ترحيبي
-        await page.wait_for_timeout(1500)
-        for sel in [
-            "button:has-text('Close')",
-            "[aria-label='Close']",
-            ".popup-close",
-            "button.close",
-            "[data-testid='close-button']",
-        ]:
+        # إغلاق Popups
+        for sel in ["button:has-text('Close')", "[aria-label='Close']", "button.close"]:
             try:
-                locator = page.locator(sel).first
-                if await locator.is_visible(timeout=1500):
-                    await locator.click()
-                    await page.wait_for_timeout(500)
-                    await snap("🧹 تم إغلاق النافذة المنبثقة")
-                    await asyncio.sleep(1.5)
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=1500):
+                    await loc.click()
+                    await page.wait_for_timeout(400)
             except Exception:
                 pass
 
-        # ═══════════════════════════════════════
-        #  🔐 تسجيل الدخول (ذكي: يتحقق أولاً من حالة الجلسة)
-        # ═══════════════════════════════════════
-        needs_login = False
-
+        # ━━ تسجيل الدخول الذكي ━━
         if LOGIN_EMAIL and LOGIN_PASSWORD:
-            await snap("🔍 التحقق من حالة تسجيل الدخول...")
+            await snap(page, context, chat_id, "🔍 التحقق من حالة الجلسة...")
 
-            # التحقق: هل يوجد زر Log in في الصفحة الحالية؟
-            for sel in [
-                'button:has-text("Log in")',
-                'a:has-text("Log in")',
-                '[data-testid="login-button"]',
-                'header button:has-text("Log in")',
-                'header a:has-text("Log in")',
-            ]:
+            if await is_login_visible(page):
+                await snap(page, context, chat_id, "🔐 تسجيل الدخول مطلوب...")
                 try:
-                    tmp = page.locator(sel).first
-                    await tmp.wait_for(state="visible", timeout=4000)
-                    needs_login = True
-                    break
-                except Exception:
-                    continue
-
-            if not needs_login:
-                # محاولة إضافية: بحث نصي واسع
-                try:
-                    page_text = await page.evaluate("() => document.body.innerText")
-                    if "log in" in page_text.lower() and "sign up" in page_text.lower():
-                        # قد يكون هناك زر مخفي، نتحقق أكثر
-                        login_any = page.locator('text=/Log in/i').first
-                        if await login_any.is_visible(timeout=2000):
-                            needs_login = True
-                except Exception:
-                    pass
-
-            if needs_login:
-                await snap("🔐 يوجد زر Log in · جاري تسجيل الدخول...")
-                try:
-                    login_btn = page.locator('button:has-text("Log in"), a:has-text("Log in")').first
-                    await login_btn.wait_for(state="visible", timeout=5000)
-                    await login_btn.click()
-
-                    await snap("🔐 تم الضغط على Log in · انتظار النموذج...")
-                    await asyncio.sleep(2.5)
-                    await page.wait_for_timeout(1000)
-
-                    # ─── إدخال البريد ───
-                    email_input = None
-                    for sel in [
-                        'input[name="email"]',
-                        'input[type="email"]',
-                        'input[placeholder*="email" i]',
-                        'input[id="email"]',
-                    ]:
-                        try:
-                            tmp = page.locator(sel).first
-                            await tmp.wait_for(state="visible", timeout=8000)
-                            email_input = tmp
-                            break
-                        except Exception:
-                            continue
-                    if not email_input:
-                        raise Exception("لم يُعثر على حقل البريد")
-
-                    await email_input.fill(LOGIN_EMAIL)
-                    await asyncio.sleep(0.5)
-
-                    # ─── إدخال كلمة المرور ───
-                    pass_input = None
-                    for sel in [
-                        'input[name="password"]',
-                        'input[type="password"]',
-                        'input[placeholder*="password" i]',
-                        'input[id="password"]',
-                    ]:
-                        try:
-                            tmp = page.locator(sel).first
-                            await tmp.wait_for(state="visible", timeout=8000)
-                            pass_input = tmp
-                            break
-                        except Exception:
-                            continue
-                    if not pass_input:
-                        raise Exception("لم يُعثر على حقل كلمة المرور")
-
-                    await pass_input.fill(LOGIN_PASSWORD)
-                    await asyncio.sleep(0.5)
-
-                    # ─── إرسال النموذج ───
-                    await snap("🔑 جاري إرسال بيانات الدخول...")
-                    await pass_input.press("Enter")
-                    await asyncio.sleep(1.0)
-                    await page.wait_for_timeout(3000)
-
-                    # Fallback submit buttons
-                    for btn_text in ['Submit', 'Sign in', 'Login', 'Continue']:
-                        try:
-                            btn = page.locator(f'button:has-text("{btn_text}")').last
-                            await btn.wait_for(state="visible", timeout=2000)
-                            await btn.click(timeout=3000)
-                            await page.wait_for_timeout(1500)
-                        except Exception:
-                            pass
-
-                    await snap("⏳ التحقق من نجاح تسجيل الدخول...")
-                    await page.wait_for_timeout(3000)
-
-                    # التحقق النهائي: هل زر Log in اختفى؟
-                    login_still_there = False
-                    for sel in [
-                        'button:has-text("Log in")',
-                        'a:has-text("Log in")',
-                        '[data-testid="login-button"]',
-                    ]:
-                        try:
-                            tmp = page.locator(sel).first
-                            await tmp.wait_for(state="visible", timeout=3000)
-                            login_still_there = True
-                            break
-                        except Exception:
-                            continue
-
-                    if not login_still_there:
-                        await snap("✅ تم تسجيل الدخول بنجاح! (سيتم الحفظ للمرات القادمة)")
-                    else:
-                        await snap("⚠️ بقي زر Log in ظاهراً (بيانات خاطئة؟)")
-
-                    await asyncio.sleep(1.5)
-
-                except Exception as login_err:
-                    logger.warning(f"Login flow error: {login_err}")
-                    await snap(f"⚠️ خطأ في تسجيل الدخول: {login_err}")
+                    await perform_login(page)
+                    await snap(page, context, chat_id, "✅ تم تسجيل الدخول!")
+                except Exception as e:
+                    logger.warning(f"Login error: {e}")
+                    await snap(
+                        page, context, chat_id,
+                        f"⚠️ خطأ في الدخول: {str(e)[:100]}",
+                    )
             else:
-                await snap("✅ أنت مسجل بالفعل! (جلسة محفوظة)")
+                await snap(page, context, chat_id, "✅ الجلسة محفوظة (مسجل مسبقاً)")
 
-        else:
-            await snap("ℹ️ لا توجد بيانات LOGIN_EMAIL/LOGIN_PASSWORD · بدون تسجيل دخول.")
+            # تحقق نهائي في /chat
+            await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(2)
 
-        # ═══════════════════════════════════════
-        #  🤖 تغيير نموذج المحادثة مباشرة
-        # ═══════════════════════════════════════
+        # ━━ اختيار النموذج ━━
         if TARGET_MODEL:
-            await snap(f"🔽 جاري اختيار النموذج: {TARGET_MODEL}...")
-            await asyncio.sleep(1.5)
-
-            model_trigger = None
-            for sel in [
-                '[data-testid="model-selector"]',
-                'button[class*="model-selector"]',
-                'button[class*="select-model"]',
-                '[aria-haspopup="listbox"]',
-                'button:has([class*="chevron"])',
-                'button[class*="model-dropdown"]',
-            ]:
-                try:
-                    tmp = page.locator(sel).first
-                    await tmp.wait_for(state="visible", timeout=5000)
-                    model_trigger = tmp
-                    break
-                except Exception:
-                    continue
-
-            if not model_trigger:
-                try:
-                    tmp = page.locator('button', has=re.compile(r"Ling|GPT|Grok|model|select", re.IGNORECASE)).first
-                    await tmp.wait_for(state="visible", timeout=3000)
-                    model_trigger = tmp
-                except Exception:
-                    model_trigger = None
-
-            if model_trigger:
-                try:
-                    await model_trigger.click()
-                    await snap("🔽 تم فتح قائمة النماذج")
-                    await asyncio.sleep(1.5)
-                    await page.wait_for_timeout(1000)
-
-                    search_input = None
-                    for sel in [
-                        'input[placeholder*="Search" i]',
-                        'input[placeholder*="search" i]',
-                        'input[placeholder*="model" i]',
-                        'input[type="text"]',
-                        '[role="searchbox"]',
-                    ]:
-                        try:
-                            tmp = page.locator(sel).first
-                            await tmp.wait_for(state="visible", timeout=5000)
-                            search_input = tmp
-                            break
-                        except Exception:
-                            continue
-
-                    if search_input:
-                        await search_input.fill(TARGET_MODEL)
-                        await asyncio.sleep(1.0)
-                        await snap(f"🔍 تم البحث عن {TARGET_MODEL}")
-
-                        result_locator = None
-                        for sel in [
-                            f'text={TARGET_MODEL}',
-                            f'div:has-text("{TARGET_MODEL}")',
-                            f'li:has-text("{TARGET_MODEL}")',
-                            '[data-testid="model-option"]',
-                            '[role="option"]',
-                            f'button:has-text("{TARGET_MODEL}")',
-                        ]:
-                            try:
-                                tmp = page.locator(sel).first
-                                await tmp.wait_for(state="visible", timeout=5000)
-                                result_locator = tmp
-                                break
-                            except Exception:
-                                continue
-
-                        if result_locator:
-                            await result_locator.click()
-                            await snap(f"✅ تم اختيار {TARGET_MODEL}")
-                        else:
-                            await search_input.press("Enter")
-                            await snap(f"⌨️ تم اختيار {TARGET_MODEL} بـ Enter")
-
-                        await asyncio.sleep(1.5)
-                        await page.wait_for_timeout(1500)
-                    else:
-                        await snap("⚠️ لم يُعثر على حقل البحث في القائمة")
-                except Exception as model_err:
-                    logger.warning(f"Model selection error: {model_err}")
-                    await snap(f"⚠️ خطأ في اختيار النموذج: {model_err}")
+            await snap(
+                page, context, chat_id,
+                f"🔽 اختيار النموذج: {TARGET_MODEL}...",
+            )
+            ok = await select_model(page, TARGET_MODEL)
+            if ok:
+                await snap(page, context, chat_id, f"✅ النموذج: {TARGET_MODEL}")
             else:
-                await snap("ℹ️ لم يُعثر على قائمة اختيار النماذج")
+                await snap(page, context, chat_id, "ℹ️ لم يُعثر على قائمة النماذج")
 
-        # ═══════════════════════════════════════════════════
-        #  ✅ تخزين page للدردشة النصية
-        # ═══════════════════════════════════════════════════
+        # ━━ جاهز للدردشة ━━
         async with streams_lock:
             if chat_id in streams and streams[chat_id].get("active"):
                 streams[chat_id]["page"] = page
+                streams[chat_id]["ready"] = True
 
-        # ═══════════════════════════════════════
-        #  📡 الحلقة المستمرة (بث حي)
-        # ═══════════════════════════════════════
+        await snap(
+            page, context, chat_id,
+            "✅ جاهز! أرسل أي رسالة الآن.\nأرسل /stop لإيقاف البث.",
+        )
+
+        # ━━ حلقة البث المستمرة ━━
         while True:
             async with streams_lock:
                 if chat_id not in streams or not streams[chat_id].get("active"):
                     break
-
-            await snap("📡 لقطة مباشرة · مُحدّثة الآن")
+            await snap(page, context, chat_id, "📡 بث مباشر · يُحدّث كل 3s")
             await asyncio.sleep(STREAM_INTERVAL)
 
     except asyncio.CancelledError:
-        logger.info(f"Stream worker cancelled for {chat_id}")
+        logger.info(f"[worker] Cancelled for {chat_id}")
         raise
     except Exception as e:
         logger.exception("Stream worker error")
         try:
             await context.bot.send_message(
-                chat_id=chat_id, text=f"⚠️ توقف البث بسبب خطأ: {e}"
+                chat_id=chat_id,
+                text=f"⚠️ توقف البث: {str(e)[:300]}",
             )
         except Exception:
             pass
     finally:
-        # ─── تنظيف Playwright ───
         if page:
             try:
                 await page.close()
@@ -484,184 +603,42 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # إزالة من الذاكرة
         async with streams_lock:
             streams.pop(chat_id, None)
 
 
 # ═══════════════════════════════════════════════════════════════
-#  ✉️ استقبال الرسائل النصية وإرسالها للموقع أثناء البث
+#  Main
 # ═══════════════════════════════════════════════════════════════
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يستقبل الرسائل أثناء وجود بث نشط ويرد بالنص"""
-    chat_id = update.effective_chat.id
-    text = update.message.text
-
-    async with streams_lock:
-        if chat_id not in streams or not streams[chat_id].get("active"):
-            return
-        session = streams[chat_id]
-        page = session.get("page")
-        lock = session.get("lock")
-        if not page:
-            await update.message.reply_text("⏳ المتصفح لم يجهز بعد، انتظر قليلاً...")
-            return
-
-    async with lock:
-        try:
-            await update.message.reply_text("⏳ جاري إرسال السؤال...")
-
-            # ─── إرسال الـ prompt للموقع ───
-            textarea = None
-            for sel in [
-                'textarea[placeholder*="Message" i]',
-                'textarea[placeholder*="message" i]',
-                'textarea[placeholder*="Grok" i]',
-                'textarea[class*="chat-input"]',
-                'textarea',
-                'div[contenteditable="true"]',
-                'input[placeholder*="Message" i]',
-            ]:
-                try:
-                    tmp = page.locator(sel).first
-                    await tmp.wait_for(state="visible", timeout=5000)
-                    textarea = tmp
-                    break
-                except Exception:
-                    continue
-
-            if not textarea:
-                raise Exception("لم يُعثر على حقل كتابة الرسالة في الموقع")
-
-            await textarea.fill(text)
-            await asyncio.sleep(0.3)
-            await textarea.press("Enter")
-
-            await update.message.reply_text("⏳ تم الإرسال! جاري انتظار الرد (قد يستغرق 10-60 ثانية)...")
-
-            # ═══════════════════════════════════════════════════
-            #  🔥 استخراج الرد باستخدام document.body.innerText
-            # ═══════════════════════════════════════════════════
-            response_text = ""
-            start_time = asyncio.get_event_loop().time()
-            last_extracted = ""
-            stable_count = 0
-
-            while (asyncio.get_event_loop().time() - start_time) < 120:
-                current_text = await page.evaluate("""(userText) => {
-                    const allText = document.body.innerText;
-                    const lines = allText.split('\\n')
-                        .map(l => l.trim())
-                        .filter(l => l.length > 0);
-                    
-                    const uiPatterns = [
-                        'Enter to send', 'Shift + Enter', 'Ctrl/Cmd + V', 'paste attachment',
-                        'attach file', 'record', 'Message Grok', 'Start a conversation',
-                        'Select a model', 'Settings', 'Gratisfy', 'to send', 'for new line',
-                        'Enter', 'Shift', 'Ctrl', 'tokens', 'tok/s', 'Navy ·', 'Grok Uncensored',
-                        'Send message', 'Attach', 'Paperclip', 'Mic', 'new line',
-                        'John ·', 'You ·', 'User ·', 'Assistant ·', 'AI ·',
-                        'type a message', 'Drag & drop', 'Web search', 'Reason',
-                        'Thinking', 'Stop generating', 'Regenerate', 'Copy',
-                        'Like', 'Dislike', 'Share', 'Export'
-                    ];
-                    
-                    const clean = lines.filter(l => {
-                        const low = l.toLowerCase();
-                        return !uiPatterns.some(p => low.includes(p.toLowerCase())) 
-                            && l !== userText 
-                            && l.length > 2
-                            && !/^\\d+\\.?\\d*\\s*s?$/.test(l)
-                            && !/^\\d+\\.?\\d*\\s*tok\\/s?$/.test(l)
-                            && !/^\\d+\\s*tokens?$/.test(l);
-                    });
-                    
-                    let userIdx = -1;
-                    for(let i = 0; i < clean.length; i++) {
-                        if(clean[i] === userText || clean[i].includes(userText) || userText.includes(clean[i])) {
-                            userIdx = i;
-                            break;
-                        }
-                    }
-                    
-                    if(userIdx >= 0 && userIdx < clean.length - 1) {
-                        return clean.slice(userIdx + 1).join('\\n');
-                    }
-                    
-                    const long = clean.filter(l => l.length > 15);
-                    if(long.length > 0) {
-                        return long.sort((a,b) => b.length - a.length)[0];
-                    }
-                    
-                    if(clean.length > 0) return clean[clean.length - 1];
-                    return '';
-                }""", [text])
-
-                current_text = (current_text or "").strip()
-
-                if current_text:
-                    if current_text == last_extracted:
-                        stable_count += 1
-                        if stable_count >= 3:
-                            response_text = current_text
-                            break
-                    else:
-                        stable_count = 0
-                        last_extracted = current_text
-
-                await asyncio.sleep(2)
-
-            # ─── إرسال النتيجة للمستخدم ───
-            if response_text:
-                cleaned = re.sub(r'\n?\d+\.?\d*\s*s?\s*\n?', '', response_text)
-                cleaned = re.sub(r'\n?\d+\.?\d*\s*tok/s?\s*\n?', '', cleaned)
-                cleaned = re.sub(r'\n?\d+\s*tokens?\s*\n?', '', cleaned)
-                cleaned = cleaned.replace('(Full Code)', '').strip()
-
-                max_len = 4000
-                if len(cleaned) <= max_len:
-                    await update.message.reply_text(cleaned)
-                else:
-                    parts = [cleaned[i:i + max_len] for i in range(0, len(cleaned), max_len)]
-                    for part in parts:
-                        await update.message.reply_text(part)
-            else:
-                await update.message.reply_text("⚠️ لم أتمكن من استخراج رد نصي من الموقع.")
-
-        except Exception as e:
-            logger.exception("Handle message error")
-            await update.message.reply_text(f"⚠️ خطأ أثناء المعالجة: {e}")
-
 
 def main():
     if not TOKEN:
-        raise RuntimeError("❌ متغير BOT_TOKEN غير موجود!")
+        raise RuntimeError("❌ BOT_TOKEN غير موجود!")
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stream", stream))
     app.add_handler(CommandHandler("stop", stop))
-
-    # استقبال الرسائل النصية (أثناء البث)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     if RAILWAY_DOMAIN:
-        secret_path = TOKEN.split(":")[-1]
-        webhook_url = f"https://{RAILWAY_DOMAIN}/{secret_path}"
+        secret = TOKEN.split(":")[-1]
+        webhook_url = f"https://{RAILWAY_DOMAIN}/{secret}"
         logger.info(f"🚀 Webhook: {webhook_url}")
-
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=secret_path,
+            url_path=secret,
             webhook_url=webhook_url,
             drop_pending_updates=True,
         )
     else:
-        logger.warning("⚠️ RAILWAY_PUBLIC_DOMAIN غير موجود! سيعمل بالـ Polling.")
-        app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+        logger.warning("⚠️ Polling mode active")
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
 
 
 if __name__ == "__main__":
