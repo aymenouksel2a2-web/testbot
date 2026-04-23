@@ -1,7 +1,8 @@
 import os
-import logging
+import io
 import re
-from telegram import Update
+import logging
+from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -21,11 +22,11 @@ WEBHOOK_URL = f"https://{RAILWAY_DOMAIN}/" if RAILWAY_DOMAIN else os.environ.get
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
 
-# ─── جوهر الحل الخارق: تشغيل متصفح حقيقي ───
-async def fetch_rendered_html(url: str) -> str:
+# ─── تشغيل Chromium + Screenshot + HTML النهائي ───
+async def fetch_with_screenshot(url: str):
     """
-    يفتح Chromium Headless حقيقي، ينتظر تحميل JS بالكامل،
-    ثم يُعيد HTML النهائي (DOM بعد تنفيذ JavaScript).
+    يُشغّل Chromium حقيقي، ينتظر JavaScript، ثم يُرجع:
+    (html_string, screenshot_bytes)
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -35,9 +36,11 @@ async def fetch_rendered_html(url: str) -> str:
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-web-security",
             ],
         )
         context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -47,76 +50,65 @@ async def fetch_rendered_html(url: str) -> str:
         page = await context.new_page()
 
         try:
-            # الانتقال للصفحة والانتظار حتى تهدأ الشبكة
             await page.goto(url, wait_until="networkidle", timeout=30000)
-            # انتظر ثانية إضافية لضمان رسم أي timers
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2500)  # تأكد من رسم الـ Timers
 
+            # التقاط صورة العرض كاملاً (Viewport)
+            screenshot = await page.screenshot(full_page=False)
             html = await page.content()
+            return html, screenshot
+
         except Exception as e:
-            html = f"ERROR:{e}"
+            return f"ERROR:{e}", None
         finally:
             await browser.close()
 
-    return html
 
-
-# ─── استخراج الوقت من DOM النهائي ───
+# ─── استخراج الوقت بدقة جراحية ───
 def extract_time_limit(soup: BeautifulSoup) -> str | None:
     """
-    استراتيجية ذكية:
-    1. ابحث عن نص 'Time limit' ثم خذ الوقت الأقرب له (في نفس العنصر الأب أو الجيران).
-    2. ابحث عن أي وقت HH:MM:SS يتبع كلمة Time limit مباشرة.
+    يستخرج الوقت HH:MM:SS المجاور لـ 'Time limit' فقط.
+    يتجاهل '1 hour 25 minutes' تماماً.
     """
 
-    # ── استراتيجية 1: نمط Regex قوي جداً يبحث عن Time limit + وقت قريب ──
-    full_text = soup.get_text(separator=" ", strip=True)
+    # ── الاستراتيجية 1: نصوص تحتوي 'Time limit' مباشرة ──
+    for text_node in soup.find_all(string=re.compile(r'Time\s*limit', re.I)):
+        parent = text_node.parent
+        # اصعد 5 مستويات في شجرة DOM وابحث في كل مستوى
+        for _ in range(5):
+            if not parent:
+                break
+            # ابحث في الأبناء عن نصوص تطابق تنسيق HH:MM:SS بالضبط
+            for descendant in parent.descendants:
+                if isinstance(descendant, str):
+                    m = re.match(r'^\s*(\d{1,2}:\d{2}:\d{2})\s*$', descendant)
+                    if m:
+                        return f"⏱ الوقت: {m.group(1)}"
+            parent = parent.parent
 
-    # ابحث عن "Time limit" + مسافات/أسطر + وقت
+    # ── الاستراتيجية 2: aria-label أو title يحتويان Time limit ──
+    for attr in ["aria-label", "title"]:
+        for tag in soup.find_all(attrs={attr: re.compile(r'Time\s*limit', re.I)}):
+            val = tag.get(attr, "")
+            m = re.search(r'(\d{1,2}:\d{2}:\d{2})', val)
+            if m:
+                return f"⏱ الوقت: {m.group(1)}"
+            # ابحث في أبناء هذا التاج
+            for child in tag.descendants:
+                if isinstance(child, str):
+                    m = re.match(r'^\s*(\d{1,2}:\d{2}:\d{2})\s*$', child)
+                    if m:
+                        return f"⏱ الوقت: {m.group(1)}"
+
+    # ── الاستراتيجية 3: Regex قوي على النص الكامل (محاصرة Time limit + وقت) ──
+    full_text = soup.get_text(separator='\n', strip=True)
     m = re.search(
-        r'Time\s*limit\D{0,30}?(\d{1,2}:\d{2}:\d{2})',
+        r'Time\s*limit[\s\S]{0,60}?(\d{1,2}:\d{2}:\d{2})',
         full_text,
-        re.IGNORECASE | re.DOTALL,
+        re.IGNORECASE,
     )
     if m:
         return f"⏱ الوقت: {m.group(1)}"
-
-    # ── استراتيجية 2: ابحث في العناصر التي تحتوي 'Time limit' ──
-    for element in soup.find_all(string=re.compile(r'Time\s*limit', re.I)):
-        parent = element.parent
-        if parent:
-            # ابحث في العنصر الأب والعم (siblings) عن HH:MM:SS
-            scope_text = parent.get_text(separator=" ", strip=True)
-            m = re.search(r'(\d{1,2}:\d{2}:\d{2})', scope_text)
-            if m:
-                return f"⏱ الوقت: {m.group(1)}"
-
-            # ابحث في الأعلى (ancestors) لأعلى 3 مستويات
-            for _ in range(3):
-                parent = parent.parent if parent.parent else None
-                if not parent:
-                    break
-                scope_text = parent.get_text(separator=" ", strip=True)
-                m = re.search(r'(\d{1,2}:\d{2}:\d{2})', scope_text)
-                if m:
-                    return f"⏱ الوقت: {m.group(1)}"
-
-    # ── استراتيجية 3: ابحث في أي عنصر يحتوي '03:00:00' أو '01:00:00' ──
-    # في Google Skills غالباً يكون الوقت في <div> أو <span> منفصل
-    time_spans = soup.find_all(string=re.compile(r'^\d{1,2}:\d{2}:\d{2}$'))
-    for t in time_spans:
-        txt = str(t).strip()
-        # تأكد أنه ليس مجرد تاريخ/وقت عشوائي في الصفحة
-        # في Skills الوقت غالباً يكون في box زمني (H >= 1 للمختبرات)
-        parts = txt.split(":")
-        if len(parts) == 3 and int(parts[0]) >= 1:
-            # تحقق من أن الجار الأكبر يحتوي Time أو limit أو Lab
-            parent_text = t.parent.get_text(separator=" ", strip=True).lower() if t.parent else ""
-            grandparent = t.parent.parent if t.parent and t.parent.parent else None
-            grand_text = grandparent.get_text(separator=" ", strip=True).lower() if grandparent else ""
-
-            if any(word in parent_text or word in grand_text for word in ["time", "limit", "lab", "hour", "credit"]):
-                return f"⏱ الوقت: {txt}"
 
     return None
 
@@ -126,8 +118,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"👋 أهلاً {user.first_name}!\n\n"
-        "🔥 البوت الآن يستخدم **متصفح Chromium حقيقي** داخل السيرفر.\n"
-        "أرسل أي رابط من Google Skills وسأستخرج الوقت حتى لو كان مخبّأً داخل JavaScript.\n\n"
+        "🔥 البوت يستخدم **Chromium Headless حقيقي** + **Screenshot**.\n"
+        "أرسل رابط Google Skills وسأُرسل لك صورة الصفحة + الوقت المستخرج.\n\n"
         "📎 مثال:\n"
         "`https://www.skills.google/focuses/19146?parent=catalog`",
         parse_mode="Markdown",
@@ -137,10 +129,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 كيفية الاستخدام:\n"
-        "1. انسخ رابط المختبر.\n"
-        "2. ألصقه هنا.\n"
-        "3. انتظر 5-10 ثوانٍ حتى أُشغّل المتصفح وأقرأ DOM النهائي.\n\n"
-        "⚠️ الوقت أطول قليلاً لكن الدقة 100%."
+        "1. أرسل رابط المختبر.\n"
+        "2. انتظر 5-10 ثوانٍ حتى أُشغّل المتصفح.\n"
+        "3. سأُرسل لك **لقطة شاشة** من الموقع + الوقت المستخرج.\n\n"
+        "⚠️ إذا فشل الاستخراج التلقائي، ستُشاهد الوقت بنفسك في الصورة."
     )
 
 
@@ -167,31 +159,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         msg = await update.message.reply_text(
-            "⏳ جاري تشغيل Chromium Headless وتحميل JavaScript...\n"
-            "⏱ قد يستغرق 5-10 ثوانٍ."
+            "⏳ جاري تشغيل Chromium + انتظار JavaScript + التقاط صورة..."
         )
 
-        raw_html = await fetch_rendered_html(url)
+        html, screenshot = await fetch_with_screenshot(url)
 
-        if raw_html.startswith("ERROR:"):
-            await msg.edit_text(f"❌ فشل تحميل المتصفح:\n`{raw_html}`", parse_mode="Markdown")
+        if screenshot is None:
+            await msg.edit_text(f"❌ فشل تحميل المتصفح:\n`{html}`", parse_mode="Markdown")
             continue
 
-        soup = BeautifulSoup(raw_html, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
         time_result = extract_time_limit(soup)
 
+        # حذف رسالة التحميل
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+        # ── إرسال Screenshot + النتيجة ──
+        photo = InputFile(io.BytesIO(screenshot), filename="skills_screenshot.png")
+
         if time_result:
-            await msg.edit_text(
-                f"✅ **{time_result}**\n\n"
-                f"🔗 {url}",
+            await update.message.reply_photo(
+                photo=photo,
+                caption=f"✅ **{time_result}**\n\n🔗 {url}",
                 parse_mode="Markdown",
             )
         else:
-            # debug: أرسل أول 500 حرف من النص المستخرج للتحليل (يمسحه لاحقاً)
-            preview = soup.get_text(separator=" ", strip=True)[:300].replace("\n", " ")
-            await msg.edit_text(
-                "⚠️ لم أجد الوقت بعد تحميل JavaScript.\n"
-                f"🕵️ preview: `{preview}...`",
+            await update.message.reply_photo(
+                photo=photo,
+                caption=(
+                    "⚠️ لم أستخرج الوقت تلقائياً، لكن هذه **لقطة شاشة حقيقية** "
+                    "من الصفحة بعد تشغيل JavaScript:\n\n"
+                    f"🔗 {url}\n\n"
+                    "🕵️ يمكنك قراءة الوقت من الصورة مباشرة."
+                ),
                 parse_mode="Markdown",
             )
 
