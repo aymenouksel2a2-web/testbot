@@ -1,4 +1,4 @@
 python-telegram-bot>=20.0
-requests
+requests-html
 beautifulsoup4
-playwright
+lxml_html_clean  # مطلوب لـ requests-html لتجنب تحذيرات
