@@ -28,59 +28,62 @@ def hunt_labs(chat_id, start_id, end_id):
     
     try:
         with sync_playwright() as p:
+            # تشغيل المتصفح مع إعدادات تضمن الاستقرار
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             
             for lab_id in range(start_id, end_id + 1):
                 if not active_tasks.get(chat_id): break 
                 
-                if scanned_count > 0 and scanned_count % 100 == 0:
+                # تنظيف الذاكرة كل 50 رابط لضمان عدم توقف السيرفر
+                if scanned_count > 0 and scanned_count % 50 == 0:
                     page.close()
                     page = browser.new_page()
                 
                 lab_id_str = f"{lab_id:05d}"
-                # الرابط النصي الصحيح بدون أي تنسيقات إضافية
-                url = f"[https://www.skills.google/focuses/](https://www.skills.google/focuses/){lab_id_str}?parent=catalog"
+                
+                # --- الرابط مصلح هنا (نص خالص بدون أي تنسيق ماركداون) ---
+                base_url = "[https://www.skills.google/focuses/](https://www.skills.google/focuses/)"
+                url = f"{base_url}{lab_id_str}?parent=catalog"
                 
                 scanned_count += 1
                 
                 try:
-                    # الدخول للرابط مع انتظار تحميل المحتوى
-                    page.goto(url, timeout=20000, wait_until="domcontentloaded")
+                    # الدخول للرابط
+                    page.goto(url, timeout=30000, wait_until="domcontentloaded")
+                    # الانتظار للتأكد من حدوث التحويل (Redirect) أو تحميل الصفحة
+                    page.wait_for_timeout(2000)
                     
-                    # الحل النهائي: التحقق من الرابط الحالي بعد التحميل
-                    # إذا قام الموقع بتحويلك للصفحة الرئيسية، فهذا المختبر غير موجود
                     current_url = page.url
+                    # إذا تم تحويلنا للرابط الرئيسي، فهذا يعني أن المختبر غير موجود
                     if "/focuses/" not in current_url or lab_id_str not in current_url:
-                        continue # تخطي هذا الرقم لأنه غير موجود
-                    
-                    # إذا وصلنا هنا، فهذا يعني أن الصفحة موجودة فعلاً
-                    time.sleep(2.5) 
-                    
-                    js_code = """
-                    () => {
-                        let titleEl = document.querySelector('h1');
-                        let title = titleEl ? titleEl.innerText.trim() : "بدون عنوان";
-                        let allText = document.documentElement.innerText || document.body.textContent;
-                        let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
-                        if (match) {
-                            return { time: match[0], title: title };
+                        pass 
+                    else:
+                        # استخراج البيانات إذا كان المختبر حقيقياً
+                        js_code = """
+                        () => {
+                            let titleEl = document.querySelector('h1');
+                            let title = titleEl ? titleEl.innerText.trim() : "بدون عنوان";
+                            let allText = document.documentElement.innerText || document.body.textContent;
+                            let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
+                            return { 
+                                time: match ? match[0] : null, 
+                                title: title 
+                            };
                         }
-                        return null;
-                    }
-                    """
-                    result = page.evaluate(js_code)
-                    
-                    if result and result.get('time'):
-                        found_count += 1
-                        found_msg = (
-                            f"🎯 مختبر جديد!\n\n"
-                            f"📌 الرقم: `{lab_id_str}`\n"
-                            f"🏷️ العنوان: {result['title']}\n"
-                            f"⏳ الوقت: `{result['time']}`\n"
-                            f"🔗 الرابط: {url}"
-                        )
-                        bot.send_message(chat_id, found_msg, disable_web_page_preview=True)
+                        """
+                        result = page.evaluate(js_code)
+                        
+                        if result and result.get('time'):
+                            found_count += 1
+                            found_msg = (
+                                f"🎯 مختبر جديد!\n\n"
+                                f"📌 الرقم: `{lab_id_str}`\n"
+                                f"🏷️ العنوان: {result['title']}\n"
+                                f"⏳ الوقت: `{result['time']}`\n"
+                                f"🔗 الرابط: {url}"
+                            )
+                            bot.send_message(chat_id, found_msg, disable_web_page_preview=True)
                             
                 except Exception:
                     continue
@@ -110,8 +113,8 @@ def hunt_labs(chat_id, start_id, end_id):
                     except: pass
             
             browser.close()
-    except Exception:
-        bot.send_message(chat_id, "❌ خطأ في النظام.")
+    except Exception as e:
+        print(f"Error: {e}")
     finally:
         active_tasks[chat_id] = False
         bot.send_message(chat_id, "🛑 انتهت العملية.")
@@ -130,5 +133,7 @@ def handle_hunt(m):
     p = m.text.split()
     if len(p) == 3:
         threading.Thread(target=hunt_labs, args=(m.chat.id, int(p[1]), int(p[2]))).start()
+    else:
+        bot.reply_to(m, "استخدم الصيغة: `/hunt 19140 19150`", parse_mode="Markdown")
 
 bot.infinity_polling()
