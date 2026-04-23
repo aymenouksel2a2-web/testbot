@@ -1,118 +1,74 @@
 import os
-import re
-import time
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- إعدادات ---
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+# ─── الإعدادات ───
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-# --- دالة الاستخراج باستخدام Selenium (متزامنة) ---
-def extract_text_with_selenium(url: str) -> str:
-    """
-    تستخدم Selenium لتحميل الصفحة واستخراج النص الكامل، بما في ذلك المحتوى الديناميكي.
-    تعمل بشكل متزامن (synchronous) لتجنب مشاكل asyncio.
-    """
-    driver = None
-    try:
-        # إعداد خيارات Chrome
-        chrome_options = Options()
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        
-        # استخدام ChromeDriver المثبت تلقائياً عبر webdriver-manager
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        
-        # تحميل الصفحة
-        driver.get(url)
-        
-        # انتظار تحميل المحتوى الأساسي (حتى يظهر body)
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        # انتظار إضافي للـ JavaScript
-        time.sleep(3)
-        
-        # الحصول على HTML الكامل بعد التحميل
-        page_html = driver.page_source
-        
-        # تحليل HTML باستخدام BeautifulSoup
-        soup = BeautifulSoup(page_html, 'html.parser')
-        all_text = soup.get_text(separator='\n', strip=True)
-        
-        # البحث عن وقت المختبر بصيغة HH:MM:SS
-        time_pattern = r'\b\d{1,2}:\d{2}:\d{2}\b'
-        time_matches = re.findall(time_pattern, all_text)
-        
-        if time_matches:
-            lab_time = time_matches[0]
-            return f"⏱️ وقت المختبر: {lab_time}\n\n{all_text}"
-        else:
-            return f"⚠️ لم يتم العثور على وقت محدد.\n\n{all_text}"
-    except Exception as e:
-        return f"❌ فشل استخراج النص: {e}"
-    finally:
-        if driver:
-            driver.quit()
+TOKEN = os.environ.get("BOT_TOKEN")           # توكن البوت (مطلوب)
+PORT = int(os.environ.get("PORT", "8080"))    # منفذ Railway (افتراضي 8080)
 
-# --- دوال تيليجرام ---
+# Railway يُوفّر هذا المتغير تلقائياً بعد النشر
+RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+WEBHOOK_URL = f"https://{RAILWAY_DOMAIN}/" if RAILWAY_DOMAIN else os.environ.get("WEBHOOK_URL")
+
+
+# ─── الأوامر ───
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     await update.message.reply_text(
-        "👋 مرحبًا! أنا بوت استخراج النصوص.\n"
-        "أرسل لي رابط (URL) لأي صفحة ويب، وسأقوم باستخراج النص الموجود فيها وإرساله لك.\n"
-        "✍️ مثال: https://www.skills.google/focuses/19146"
+        f"أهلاً {user.first_name}! 👋\n"
+        "أنا بوت يعمل على Railway 🚀\n"
+        "جرب إرسال أي رسالة وسأرددها."
     )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    url_pattern = r'(https?://[^\s]+)'
-    urls = re.findall(url_pattern, user_text)
-    
-    if urls:
-        await update.message.reply_text("⏳ جاري استخراج النص من الرابط... قد يستغرق ذلك 20-30 ثانية.")
-        
-        url = urls[0]
-        # تشغيل دالة Selenium المتزامنة في thread منفصل بدون مشاكل event loop
-        import asyncio
-        loop = asyncio.get_event_loop()
-        extracted_text = await loop.run_in_executor(None, extract_text_with_selenium, url)
-        
-        max_length = 4096
-        if len(extracted_text) > max_length:
-            preview = extracted_text[:max_length-200] + "...\n\n[تم اقتطاع النص لأنه طويل جدًا]"
-            await update.message.reply_text(preview)
-        else:
-            await update.message.reply_text(extracted_text)
-    else:
-        await update.message.reply_text("🤔 لم أجد رابطًا صالحًا في رسالتك. من فضلك أرسل رابط URL.")
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 الأوامر المتوفرة:\n"
+        "/start - بدء المحادثة\n"
+        "/help - عرض هذه القائمة"
+    )
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"رددت: {update.message.text}")
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("حدث خطأ: %s", context.error)
+
+
+# ─── التشغيل ───
 def main():
     if not TOKEN:
-        print("❌ خطأ: لم يتم تعيين TELEGRAM_BOT_TOKEN في متغيرات البيئة.")
-        return
-    
+        raise ValueError("❌ لم يتم تعيين متغير البيئة BOT_TOKEN!")
+
     app = Application.builder().token(TOKEN).build()
+
+    # تسجيل المعالجات
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("🤖 البوت يعمل الآن...")
-    # drop_pending_updates=True لحل مشكلة تعارض الجلسات
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    app.add_error_handler(error_handler)
+
+    # التشغيل (Webhook على Railway - Polling محلياً)
+    if WEBHOOK_URL and WEBHOOK_URL != "https:///":
+        logger.info(f"✅ تشغيل Webhook: {WEBHOOK_URL}")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL,
+        )
+    else:
+        logger.info("🔄 تشغيل Polling (وضع التطوير)...")
+        app.run_polling()
+
 
 if __name__ == "__main__":
     main()
