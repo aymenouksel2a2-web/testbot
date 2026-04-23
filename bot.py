@@ -19,7 +19,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
 WEBHOOK_URL = f"https://{RAILWAY_DOMAIN}/" if RAILWAY_DOMAIN else os.environ.get("WEBHOOK_URL")
 
-# Regex لاكتشاف الروابط (محسّن)
+# Regex لاكتشاف الروابط
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
 
@@ -67,13 +67,50 @@ async def fetch_url_html(url: str):
 
 def extract_time_from_skills(html: str, soup: BeautifulSoup) -> str | None:
     """
-    تستخرج الـ Time Limit من صفحات skills.google (Google Cloud Skills Boost).
-    تعمل حتى لو كان الوقت مخبّأً داخل JSON أو داخل <script>.
+    تستخرج Time Limit من صفحات skills.google بدقة.
+    الأولوية:
+    1. timeLimitSeconds/timeLimit داخل <script>
+    2. النص الظاهر المحيط بـ "Time limit"
+    3. JSON-LD (احتياطي)
     """
 
-    # ── المحاولة 1: JSON-LD (Structured Data) ──
-    scripts = soup.find_all("script", type="application/ld+json")
-    for script in scripts:
+    # ── المحاولة 1: البحث الدقيق في كل <script> ──
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        # ابحث عن timeLimitSeconds: 10800  (الأدق في Google Skills)
+        m = re.search(r'timeLimitSeconds["\']?\s*[:=]\s*(\d+)', text)
+        if m:
+            logger.info(f"Found timeLimitSeconds raw: {m.group(1)}")
+            return format_seconds(int(m.group(1)))
+
+        # ابحث عن "timeLimit": "03:00:00"
+        m = re.search(r'timeLimit["\']?\s*[:=]\s*["\']?(\d{1,2}:\d{2}:\d{2})', text)
+        if m:
+            logger.info(f"Found timeLimit string: {m.group(1)}")
+            return f"⏱ الوقت: {m.group(1)}"
+
+    # ── المحاولة 2: البحث في النص الظاهر حول "Time limit" ──
+    # نحافظ على الأسطر المنفصلة لأن الوقت غالبًا في سطر مستقل فوق/تحت "Time limit"
+    lines = [
+        line.strip()
+        for line in soup.get_text(separator="\n", strip=True).splitlines()
+        if line.strip()
+    ]
+
+    for i, line in enumerate(lines):
+        if re.search(r'Time\s*limit', line, re.IGNORECASE):
+            # افحص السطرين السابقين والسطرين التاليين (تجاهل السطر نفسه)
+            for j in range(max(0, i - 2), min(len(lines), i + 3)):
+                candidate = lines[j]
+                if re.search(r'Time\s*limit', candidate, re.IGNORECASE):
+                    continue
+                time_match = re.search(r'\b(\d{1,2}:\d{2}:\d{2})\b', candidate)
+                if time_match:
+                    logger.info(f"Found time near 'Time limit': {time_match.group(1)}")
+                    return f"⏱ الوقت: {time_match.group(1)}"
+
+    # ── المحاولة 3: JSON-LD (Structured Data) - احتياطي ──
+    for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string)
             items = data if isinstance(data, list) else [data]
@@ -81,51 +118,10 @@ def extract_time_from_skills(html: str, soup: BeautifulSoup) -> str | None:
                 if isinstance(item, dict):
                     tr = item.get("timeRequired")
                     if tr:
-                        # غالباً ما يكون الشكل PT3H
-                        iso = parse_iso_duration(tr)
-                        return f"⏱ الوقت: {iso}"
+                        logger.info(f"Found JSON-LD timeRequired: {tr}")
+                        return f"⏱ الوقت: {parse_iso_duration(tr)}"
         except Exception:
             pass
-
-    # ── المحاولة 2: داخل أي <script> ابحث عن timeLimitSeconds أو duration بالثواني ──
-    for script in soup.find_all("script"):
-        if not script.string:
-            continue
-        text = script.string
-
-        # ابحث عن timeLimitSeconds: 10800
-        m = re.search(r'timeLimitSeconds["\']?\s*[:=]\s*(\d+)', text)
-        if m:
-            return format_seconds(int(m.group(1)))
-
-        # ابحث عن "duration": 10800
-        m = re.search(r'"duration"\s*:\s*(\d+)', text)
-        if m:
-            secs = int(m.group(1))
-            if secs >= 3600:  # فقط إذا كانت القيمة منطقية (ساعة أو أكثر)
-                return format_seconds(secs)
-
-    # ── المحاولة 3: البحث في النص المرئي عن HH:MM:SS بالقرب من Time limit ──
-    # نستخدم get_text لإزالة التاجات والحصول على نص نظيف
-    visible_text = soup.get_text(separator=" ", strip=True)
-
-    # ابحث عن كل الأوقات
-    time_matches = list(re.finditer(r'\b(\d{1,2}:\d{2}:\d{2})\b', visible_text))
-
-    for match in time_matches:
-        # خذ مقطعاً من النص حول الوقت (±200 حرف)
-        start = max(0, match.start() - 200)
-        end = min(len(visible_text), match.end() + 200)
-        snippet = visible_text[start:end].lower()
-
-        if any(keyword in snippet for keyword in ["time limit", "time-limit", "timelimit", "timed", "limit"]):
-            return f"⏱ الوقت: {match.group(1)}"
-
-    # ── المحاولة 4: احتياطي - أي وقت طويل (ساعات >= 1) ──
-    for match in time_matches:
-        hours = int(match.group(1).split(":")[0])
-        if hours >= 1:
-            return f"⏱ الوقت: {match.group(1)}"
 
     return None
 
@@ -136,7 +132,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 أهلاً {user.first_name}!\n\n"
         "أنا بوت متخصص في استخراج **وقت المختبر** من روابط Google Skills Boost.\n\n"
-        "📎 فقط أرسل لي رابطاً مثل:\n"
+        "📎 أرسل لي رابطاً مثل:\n"
         "`https://www.skills.google/focuses/19146?parent=catalog`",
         parse_mode="Markdown"
     )
@@ -146,9 +142,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 كيفية الاستخدام:\n"
         "1. انسخ رابط المختبر من skills.google.\n"
-        "2. ألصقه هنا في الدردشة.\n"
-        "3. سأرسل لك الوقت المحدد (مثل 03:00:00) فوراً.\n\n"
-        "⚠️ ملاحظة: بعض المختبرات قد تحتاج تسجيل دخول، وفي هذه الحالة قد لا أتمكن من قراءة الوقت."
+        "2. ألصقه هنا.\n"
+        "3. سأرسل لك الوقت المحدد (مثل 03:00:00).\n\n"
+        "⚠️ بعض الصفحات تتطلب تسجيل دخين، وقد لا أتمكن من قراءتها."
     )
 
 
@@ -167,14 +163,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for url in urls:
-        # تأكد من صحة البروتوكول
         if not url.startswith(("http://", "https://")):
             continue
 
-        # التحقق إذا كان الرابط من skills.google
-        is_skills = "skills.google" in url
-
-        if not is_skills:
+        if "skills.google" not in url:
             await update.message.reply_text(
                 "⚠️ هذا البوت متخصص حالياً في روابط `skills.google` فقط.\n"
                 f"🔗 {url}",
@@ -182,7 +174,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             continue
 
-        # جلب الصفحة
         msg = await update.message.reply_text("⏳ جاري تحليل الرابط واستخراج الوقت...")
         html, soup = await fetch_url_html(url)
 
@@ -190,7 +181,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"❌ فشل الوصول:\n{html}")
             continue
 
-        # استخراج الوقت
         time_result = extract_time_from_skills(html, soup)
 
         if time_result:
@@ -202,9 +192,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await msg.edit_text(
                 "⚠️ لم أتمكن من العثور على الوقت في هذه الصفحة.\n"
-                "قد يكون أحد الأسباب:\n"
-                "• الصفحة تتطلب تسجيل دخين.\n"
-                "• تم تغيير هيكل الموقع.\n"
+                "الأسباب المحتملة:\n"
+                "• الصفحة تتطلب تسجيل دخول.\n"
+                "• تم تغيير تصميم الموقع.\n"
                 "• الرابط غير صحيح."
             )
 
