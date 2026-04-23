@@ -507,7 +507,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with lock:
         try:
-            await update.message.reply_text("⏳ جاري إرسال السؤال والانتظار للرد...")
+            await update.message.reply_text("⏳ جاري إرسال السؤال...")
 
             # ─── إرسال الـ prompt للموقع ───
             textarea = None
@@ -531,12 +531,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 raise Exception("لم يُعثر على حقل كتابة الرسالة في الموقع")
 
             await textarea.fill(text)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
             await textarea.press("Enter")
 
             await update.message.reply_text("⏳ تم الإرسال! جاري انتظار رد النموذج (قد يستغرق 10-60 ثانية)...")
 
-            # ─── انتظار الرد وقراءته ───
+            # ─── انتظار ظهور الرد وقراءته عبر JavaScript ───
+            await asyncio.sleep(2)  # مهلة أولية للبدء
+
             response_text = ""
             start_time = asyncio.get_event_loop().time()
             last_text = ""
@@ -544,33 +546,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             while (asyncio.get_event_loop().time() - start_time) < 120:
                 current_text = ""
+
                 try:
-                    for sel in [
-                        '.message-item.bot-message:last-child .message-content',
-                        '.message.bot:last-child .content',
-                        '[data-testid="assistant-message"]',
-                        '[data-testid="assistant-message"] .markdown-body',
-                        '.markdown-body:last-child',
-                        '.prose:last-child',
-                        'div[class*="message"]:nth-last-child(1) div[class*="content"]',
-                        'div[class*="chat"]:nth-last-child(1) div[class*="text"]',
-                    ]:
-                        try:
-                            el = page.locator(sel).last
-                            txt = await el.inner_text(timeout=3000)
-                            if txt and txt.strip() and txt.strip() != text.strip():
-                                current_text = txt.strip()
-                                break
-                        except Exception:
-                            continue
-                except Exception:
-                    pass
+                    # استخدام JavaScript للبحث في DOM بشكل أعمق وأقوى
+                    result = await page.evaluate(
+                        """([userText]) => {
+                            const selectors = [
+                                '.message-item.bot-message:last-child .message-content',
+                                '.message.bot:last-child .content',
+                                '[data-testid="assistant-message"]',
+                                '[data-testid="assistant-message"] .markdown-body',
+                                '.markdown-body:last-child',
+                                '.prose:last-child',
+                                'div[class*="message-content"]',
+                                'div[class*="prose"]',
+                                'div[class*="markdown-body"]',
+                                '.flex-col-reverse div[class*="group"] .whitespace-pre-wrap',
+                                'div[class*="flex-col"] div[class*="rounded-2xl"] div[class*="text-sm"]',
+                                'div[class*="chat"] div[class*="response"]',
+                                'div[class*="bot"] div[class*="message"]',
+                                'div[class*="assistant"] div[class*="message"]',
+                                'div[class*="bubble"]:last-child',
+                                'article',
+                                'div[role="log"] > div:last-child'
+                            ];
+                            for (const sel of selectors) {
+                                const els = document.querySelectorAll(sel);
+                                if (els.length > 0) {
+                                    const last = els[els.length - 1];
+                                    const txt = (last.innerText || last.textContent || '').trim();
+                                    if (txt && txt.length > 0 && txt !== userText.trim()) {
+                                        return txt;
+                                    }
+                                }
+                            }
+                            // fallback: أي عنصر يحتوي على نص في الجزء السفلي من الشاشة
+                            const allDivs = document.querySelectorAll('div');
+                            for (let i = allDivs.length - 1; i >= Math.max(0, allDivs.length - 20); i--) {
+                                const txt = (allDivs[i].innerText || '').trim();
+                                if (txt.length > 2 && txt !== userText.trim() && allDivs[i].children.length <= 5) {
+                                    return txt;
+                                }
+                            }
+                            return '';
+                        }""",
+                        [text],
+                    )
+                    current_text = (result or "").strip()
+                except Exception as eval_err:
+                    logger.warning(f"JS evaluate error: {eval_err}")
+                    current_text = ""
 
                 if current_text:
                     # إذا لم يتغير النص لمدة 6 ثوانٍ متتالية، نعتبر أن الرد اكتمل
                     if current_text == last_text:
                         stable_count += 1
-                        if stable_count >= 3:  # 3 * sleep(2) = ~6 ثوانٍ ثابتة
+                        if stable_count >= 3:  # 3 × 2 ثانية = ~6 ثوانٍ ثابتة
                             response_text = current_text
                             break
                     else:
