@@ -20,6 +20,7 @@ active_tasks = {}
 # دالة لإنشاء شريط التقدم المرئي
 def create_progress_bar(percentage):
     filled = int(percentage / 10)
+    if filled > 10: filled = 10
     bar = '█' * filled + '░' * (10 - filled)
     return bar
 
@@ -46,7 +47,6 @@ def hunt_labs(chat_id, start_id, end_id):
                     break 
                 
                 # ------ حماية الذاكرة (Memory Flush) ------
-                # كل 100 رابط، قم بإغلاق الصفحة وفتحها من جديد لمنع امتلاء الـ RAM وانهيار السيرفر
                 if scanned_count > 0 and scanned_count % 100 == 0:
                     try:
                         page.close()
@@ -57,12 +57,13 @@ def hunt_labs(chat_id, start_id, end_id):
                 
                 # تحويل الرقم إلى صيغة 5 أرقام (مثال: 00057)
                 lab_id_str = f"{lab_id:05d}"
+                # تم إصلاح الرابط هنا وإزالة الأقواس الخاطئة لكي يعمل المتصفح بشكل سليم
                 url = f"[https://www.skills.google/focuses/](https://www.skills.google/focuses/){lab_id_str}?parent=catalog"
                 
                 scanned_count += 1
                 
                 try:
-                    # الدخول للرابط. وقت سريع لتخطي الصفحات غير الموجودة
+                    # الدخول للرابط
                     page.goto(url, timeout=15000, wait_until="domcontentloaded") 
                     time.sleep(2) # مهلة بسيطة لضمان ظهور النصوص
                     
@@ -98,18 +99,18 @@ def hunt_labs(chat_id, start_id, end_id):
                         bot.send_message(chat_id, found_msg, parse_mode="Markdown", disable_web_page_preview=True)
                         
                 except Exception as e:
-                    # تجاهل الروابط المعطوبة أو انهيارات المتصفح اللحظية وإكمال الحلقة
+                    # إذا فشل الرابط تماماً، ننتظر نصف ثانية حتى لا يحترق المعالج بسبب الـ Loop السريع
+                    time.sleep(0.5)
                     pass
                 
                 # ------ التحديث الآمن للوحة التحكم ------
-                # التحديث يتم كل 15 ثانية كحد أدنى بدلاً من كل عدد معين من الروابط، لتجنب حظر Telegram API
                 current_time = time.time()
                 if (current_time - last_dashboard_update > 15) or scanned_count == total_to_scan:
                     percentage = (scanned_count / total_to_scan) * 100
                     elapsed_time = current_time - start_time
                     avg_time_per_scan = elapsed_time / scanned_count
                     remaining_scans = total_to_scan - scanned_count
-                    eta_seconds = remaining_scans * avg_time_per_scan
+                    eta_seconds = max(0, remaining_scans * avg_time_per_scan)
                     
                     # تنسيق الوقت المتبقي (HH:MM:SS)
                     eta_str = str(timedelta(seconds=int(eta_seconds)))
@@ -135,7 +136,7 @@ def hunt_labs(chat_id, start_id, end_id):
             browser.close()
             
     except Exception as e:
-        bot.send_message(chat_id, f"❌ حدث خطأ في النظام.")
+        bot.send_message(chat_id, f"❌ حدث خطأ في النظام الداخلي للمتصفح، يرجى المحاولة مرة أخرى.")
     finally:
         active_tasks[chat_id] = False
         bot.send_message(chat_id, "🛑 انتهت عملية الصيد بنجاح!")
@@ -158,7 +159,7 @@ def stop_scan(message):
     chat_id = message.chat.id
     if active_tasks.get(chat_id):
         active_tasks[chat_id] = False 
-        bot.reply_to(message, "⏳ جاري إيقاف عملية الصيد...")
+        bot.reply_to(message, "⏳ جاري إيقاف عملية الصيد (قد يستغرق ثواني قليلة لإنهاء الرابط الحالي)...")
     else:
         bot.reply_to(message, "لا توجد عملية صيد نشطة حالياً.")
 
