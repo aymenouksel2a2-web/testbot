@@ -16,96 +16,125 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # قاموس لتتبع العمليات النشطة لمنع تداخل الطلبات
 active_tasks = {}
 
-# دالة للتحقق من صحة الرابط
-def is_valid_url(url):
-    regex = re.compile(r'^(?:http|ftp)s?://', re.IGNORECASE)
-    return re.match(regex, url) is not None
-
-# الدالة المسؤولة عن الدخول واستخراج وقت اللاب تحديداً
-def extract_lab_time(chat_id, url):
+# الدالة المسؤولة عن الفحص المتسلسل
+def scan_labs(chat_id, start_id, end_id):
     active_tasks[chat_id] = True
+    filename = f"results_{chat_id}.txt"
+    
+    # إنشاء ملف جديد ومسح محتواه القديم إن وجد
+    open(filename, 'w').close()
+    
+    found_count = 0
     
     try:
         with sync_playwright() as p:
             # تشغيل المتصفح في وضع مخفي
             browser = p.chromium.launch(headless=True)
+            # إعادة استخدام نفس الصفحة (Page) لتسريع العملية بدلاً من فتح متصفح جديد كل مرة
             page = browser.new_page()
             
-            # تعيين أبعاد الشاشة (يمكنك تركها حتى لو لم نلتقط صورة لأنها تساعد في تحميل الصفحة بشكل صحيح)
-            page.set_viewport_size({"width": 1280, "height": 720})
+            bot.send_message(chat_id, f"🚀 بدأ الفحص الشامل من ID `{start_id}` إلى `{end_id}`...\n\n(لإيقاف الفحص واستلام الملف، أرسل /stop في أي وقت)")
             
-            bot.send_message(chat_id, "⏳ جاري الدخول للصفحة... سأقوم باستخراج الوقت بالقوة الإجبارية 🕵️‍♂️")
-            
-            # الدخول للرابط والانتظار حتى اكتمال تحميل الشبكة
-            page.goto(url, timeout=60000, wait_until="networkidle") 
-            time.sleep(5) # مهلة إضافية لضمان استقرار الصفحة بالكامل وظهور العداد
-            
-            lab_time = None
-            
-            # الحل الجذري: حقن كود جافاسكريبت داخل المتصفح لسحب الوقت بالقوة متجاوزاً (Shadow DOM)
-            js_code = """
-            () => {
-                // سحب كل النصوص المرئية والمخفية في عمق الصفحة
-                let allText = document.documentElement.innerText || document.body.textContent;
-                // البحث عن صيغة 00:00:00 (رقمين:رقمين:رقمين)
-                let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
-                return match ? match[0] : null;
-            }
-            """
-            
-            # تنفيذ الكود داخل الصفحة
-            lab_time = page.evaluate(js_code)
-            
-            # إذا لم ينجح الجافاسكريبت (نادر جداً)، نستخدم بحث Playwright العميق كخطة بديلة
-            if not lab_time:
-                elements = page.locator("text=/[0-9]{2}:[0-9]{2}:[0-9]{2}/").all()
-                for el in elements:
-                    text = el.inner_text().strip()
-                    match = re.search(r"\b\d{2}:\d{2}:\d{2}\b", text)
-                    if match:
-                        lab_time = match.group(0)
-                        break
-            
-            # إرسال النتيجة المستخرجة
-            if lab_time:
-                bot.send_message(chat_id, f"✅ **وقت اللاب المستخرج بنجاح:**\n\n⏱️ `{lab_time}`", parse_mode="Markdown")
-            else:
-                bot.send_message(chat_id, "⚠️ لم أتمكن من العثور على وقت اللاب في الصفحة.")
+            for lab_id in range(start_id, end_id + 1):
+                # التحقق مما إذا كان المستخدم قد طلب إيقاف الفحص
+                if not active_tasks.get(chat_id):
+                    break 
+                
+                url = f"[https://www.skills.google/focuses/](https://www.skills.google/focuses/){lab_id}?parent=catalog"
+                
+                try:
+                    # الدخول للرابط. قللنا وقت المهلة لتسريع تخطي الروابط الخاطئة (404)
+                    page.goto(url, timeout=20000, wait_until="networkidle") 
+                    time.sleep(3) # مهلة لضمان استقرار الصفحة بالكامل
+                    
+                    # الحل الجذري: حقن كود جافاسكريبت داخل المتصفح لسحب الوقت بالقوة
+                    js_code = """
+                    () => {
+                        let allText = document.documentElement.innerText || document.body.textContent;
+                        let match = allText.match(/\\b\\d{2}:\\d{2}:\\d{2}\\b/);
+                        return match ? match[0] : null;
+                    }
+                    """
+                    
+                    lab_time = page.evaluate(js_code)
+                    
+                    # إذا وجد الوقت، نقوم بحفظه في الملف
+                    if lab_time:
+                        with open(filename, 'a', encoding='utf-8') as f:
+                            f.write(f"ID: {lab_id} | Time: {lab_time} | URL: {url}\n")
+                        found_count += 1
+                        
+                        # إرسال رسالة تحديث كل 5 لابات يجدها لكي لا يزعجك ويحظر من تيليجرام
+                        if found_count % 5 == 0:
+                            bot.send_message(chat_id, f"⏳ تحديث: تم العثور على {found_count} لابات صالحة حتى الآن... (آخر ID: {lab_id})")
+                            
+                except Exception as e:
+                    # إذا فشل الدخول للرابط (صفحة غير موجودة)، يتجاهلها وينتقل للرقم التالي فوراً
+                    pass
             
             browser.close()
-                
+            
     except Exception as e:
-        error_msg = str(e)[:1000]
-        bot.send_message(chat_id, f"❌ حدث خطأ أثناء فتح الرابط:\n{error_msg}")
+        error_msg = str(e)[:500]
+        bot.send_message(chat_id, f"❌ حدث خطأ في النظام:\n{error_msg}")
     finally:
-        if chat_id in active_tasks:
-            del active_tasks[chat_id]
+        active_tasks[chat_id] = False
+        bot.send_message(chat_id, "🛑 انتهت عملية الفحص! جاري رفع ملف النتائج...")
+        
+        # إرسال الملف النصي الذي يحتوي على كل الروابط والأوقات
+        if os.path.exists(filename) and os.path.getsize(filename) > 0:
+            with open(filename, 'rb') as doc:
+                bot.send_document(chat_id, doc, caption=f"📄 تم إيجاد {found_count} لابات خلال هذا الفحص.")
+        else:
+            bot.send_message(chat_id, "لم يتم العثور على أي أوقات خلال نطاق الفحص المحدد.")
 
-# الرد على أمر البدء
+# الرد على أمر البدء والتعليمات
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
-        "مرحباً! 🤖\n\n"
-        "أرسل لي رابط اللاب (Google Skills) وسأقوم باستخراج **وقت اللاب المخصص (Time limit)** فقط وإرساله لك.\n"
+        "مرحباً بك في البوت الماسح! 🤖\n\n"
+        "أرسل الأمر `/scan` لفحص جميع الروابط من 0 إلى 99999 دفعة واحدة.\n\n"
+        "أو يمكنك تحديد نطاق مخصص للفحص عبر إرسال:\n"
+        "`/scan 19000 19200`\n\n"
+        "لإيقاف الفحص وسحب النتائج فوراً، أرسل الأمر `/stop`."
     )
-    bot.reply_to(message, welcome_text)
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
-# الرد على الروابط
-@bot.message_handler(func=lambda message: True)
-def handle_message(message):
-    text = message.text
+# أمر الإيقاف
+@bot.message_handler(commands=['stop'])
+def stop_scan(message):
+    chat_id = message.chat.id
+    if active_tasks.get(chat_id):
+        active_tasks[chat_id] = False # هذا سيوقف الحلقة (Loop) داخل عملية الفحص
+        bot.reply_to(message, "⏳ جاري إيقاف الفحص وتجهيز الملف...")
+    else:
+        bot.reply_to(message, "لا يوجد فحص نشط حالياً.")
+
+# أمر بدء الفحص
+@bot.message_handler(commands=['scan'])
+def handle_scan(message):
     chat_id = message.chat.id
     
-    if is_valid_url(text):
-        if chat_id in active_tasks:
-            bot.reply_to(message, "⚠️ أنا أقوم بمعالجة رابط حالياً، انتظر حتى أنتهي من فضلك.")
-            return
+    if active_tasks.get(chat_id):
+        bot.reply_to(message, "⚠️ هناك فحص نشط حالياً. أرسل /stop لإيقافه أولاً.")
+        return
         
-        # تشغيل العملية في مسار منفصل (Thread)
-        thread = threading.Thread(target=extract_lab_time, args=(chat_id, text))
-        thread.start()
-    else:
-        bot.reply_to(message, "عذراً، هذا ليس رابطاً صحيحاً. يرجى إرسال رابط يبدأ بـ http:// أو https://")
+    parts = message.text.split()
+    start_id = 0
+    end_id = 99999
+    
+    # التحقق مما إذا كان المستخدم أدخل نطاقاً مخصصاً (مثال: /scan 100 200)
+    if len(parts) == 3:
+        try:
+            start_id = int(parts[1])
+            end_id = int(parts[2])
+        except ValueError:
+            bot.reply_to(message, "⚠️ يرجى إدخال أرقام صحيحة، مثال: `/scan 19100 19200`", parse_mode="Markdown")
+            return
+            
+    # تشغيل العملية في مسار منفصل (Thread) لعدم تجميد البوت
+    thread = threading.Thread(target=scan_labs, args=(chat_id, start_id, end_id))
+    thread.start()
 
 if __name__ == "__main__":
     print("جاري تشغيل البوت...")
