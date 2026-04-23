@@ -30,6 +30,7 @@ def hunt_labs(chat_id, start_id, end_id):
     found_count = 0
     scanned_count = 0
     start_time = time.time()
+    last_dashboard_update = time.time() # تتبع آخر تحديث للوحة القيادة
     
     # رسالة لوحة التحكم المبدئية
     dashboard_msg = bot.send_message(chat_id, "⏳ جاري تهيئة لوحة تحكم الصيد...")
@@ -43,6 +44,16 @@ def hunt_labs(chat_id, start_id, end_id):
             for lab_id in range(start_id, end_id + 1):
                 if not active_tasks.get(chat_id):
                     break 
+                
+                # ------ حماية الذاكرة (Memory Flush) ------
+                # كل 100 رابط، قم بإغلاق الصفحة وفتحها من جديد لمنع امتلاء الـ RAM وانهيار السيرفر
+                if scanned_count > 0 and scanned_count % 100 == 0:
+                    try:
+                        page.close()
+                    except:
+                        pass
+                    page = browser.new_page()
+                # ----------------------------------------
                 
                 # تحويل الرقم إلى صيغة 5 أرقام (مثال: 00057)
                 lab_id_str = f"{lab_id:05d}"
@@ -87,12 +98,15 @@ def hunt_labs(chat_id, start_id, end_id):
                         bot.send_message(chat_id, found_msg, parse_mode="Markdown", disable_web_page_preview=True)
                         
                 except Exception as e:
+                    # تجاهل الروابط المعطوبة أو انهيارات المتصفح اللحظية وإكمال الحلقة
                     pass
                 
-                # تحديث لوحة التحكم كل 5 محاولات (لتجنب حظر تيليجرام بكثرة التعديل)
-                if scanned_count % 5 == 0 or scanned_count == total_to_scan:
+                # ------ التحديث الآمن للوحة التحكم ------
+                # التحديث يتم كل 15 ثانية كحد أدنى بدلاً من كل عدد معين من الروابط، لتجنب حظر Telegram API
+                current_time = time.time()
+                if (current_time - last_dashboard_update > 15) or scanned_count == total_to_scan:
                     percentage = (scanned_count / total_to_scan) * 100
-                    elapsed_time = time.time() - start_time
+                    elapsed_time = current_time - start_time
                     avg_time_per_scan = elapsed_time / scanned_count
                     remaining_scans = total_to_scan - scanned_count
                     eta_seconds = remaining_scans * avg_time_per_scan
@@ -114,8 +128,9 @@ def hunt_labs(chat_id, start_id, end_id):
                     
                     try:
                         bot.edit_message_text(chat_id=chat_id, message_id=dashboard_msg.message_id, text=dashboard_text)
+                        last_dashboard_update = current_time
                     except:
-                        pass # تجاهل الأخطاء إذا كان النص لم يتغير
+                        pass # تجاهل الأخطاء إذا كان النص لم يتغير أو حصل خطأ بالاتصال
             
             browser.close()
             
