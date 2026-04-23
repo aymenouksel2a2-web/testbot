@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import re
 from io import BytesIO
 from urllib.parse import urlparse
 from telegram import Update
@@ -97,46 +98,72 @@ async def fill_login_form(page, email: str, password: str):
     await email_input.scroll_into_view_if_needed()
     await email_input.click()
     await email_input.fill(email)
-    await page.wait_for_timeout(400)
+    await page.wait_for_timeout(500)
 
     await pass_input.scroll_into_view_if_needed()
     await pass_input.click()
     await pass_input.fill(password)
-    await page.wait_for_timeout(400)
+    await page.wait_for_timeout(500)
 
-    # ── النقر على زر الإرسال (أذكى طريقة) ──
+    # ── النقر على زر الإرسال (استراتيجيات متعددة) ──
     clicked = False
 
-    # جرب جميع أزرار <button> المرئية وابحث عن النصوص المناسبة
-    all_btns = await page.locator("button").all()
-    for btn in all_btns:
-        try:
-            if not await btn.is_visible():
-                continue
-            txt = await btn.text_content()
-            if txt and any(k in txt.lower() for k in ["sign in", "log in", "login", "submit"]):
-                await btn.click()
-                clicked = True
-                break
-        except Exception:
-            continue
+    # 1) Playwright get_by_role مع regex (الأدق للنصوص المرئية)
+    try:
+        submit_btn = page.get_by_role(
+            "button",
+            name=re.compile(r"sign\s*in|log\s*in|login|submit", re.IGNORECASE)
+        ).first
+        if await submit_btn.count() > 0 and await submit_btn.is_visible():
+            await submit_btn.click(force=True)
+            clicked = True
+    except Exception:
+        pass
 
+    # 2) locator :has-text (يبحث في النص المباشر)
     if not clicked:
-        # جرب input[type="submit"]
-        sub = page.locator('input[type="submit"]').first
+        for txt in ["Sign in", "Log in", "Login", "Submit"]:
+            try:
+                btn = page.locator(f'button:has-text("{txt}")').first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(force=True)
+                    clicked = True
+                    break
+            except Exception:
+                pass
+
+    # 3) جميع أزرار <button> المرئية (inner_text يعطي النص المرئي فقط)
+    if not clicked:
+        all_btns = await page.locator("button").all()
+        for btn in all_btns:
+            try:
+                if not await btn.is_visible():
+                    continue
+                txt = await btn.inner_text()
+                if txt and any(k in txt.strip().lower() for k in ["sign in", "log in", "login", "submit"]):
+                    await btn.click(force=True)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    # 4) input[type="submit"]
+    if not clicked:
         try:
+            sub = page.locator('input[type="submit"]').first
             if await sub.count() > 0 and await sub.is_visible():
                 await sub.click()
                 clicked = True
         except Exception:
             pass
 
+    # 5) Fallback مضمون: الضغط على Enter في حقل كلمة المرور
     if not clicked:
-        # الأخير: اضغط Enter في حقل كلمة المرور
         await pass_input.press("Enter")
+        clicked = True
 
     # ── انتظر الانتقال ──
-    await page.wait_for_timeout(3000)
+    await page.wait_for_timeout(3500)
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
     except Exception:
@@ -186,14 +213,13 @@ async def run_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
                 if success:
                     await context.bot.send_message(chat_id=chat_id, text="✅ تم تسجيل الدخول.")
                 else:
-                    # أرسل لقطة للمستخدم ليرى ما إذا بقيت في صفحة الدخول
                     ss = await page.screenshot(type="png", full_page=False)
                     buf = BytesIO(ss)
                     buf.name = "login_check.png"
                     await context.bot.send_photo(
                         chat_id=chat_id,
                         photo=buf,
-                        caption="⚠️ ما زلت هنا؟ إذا ظهرت صفحة تسجيل الدخول، فقد تحتاج لتحديث بياناتك أو يتطلب الموقع خطوة إضافية."
+                        caption="⚠️ ما زلت هنا؟ إذا ظهرت صفحة تسجيل الدخول، قد تحتاج لتحديث بياناتك أو يتطلب الموقع خطوة إضافية."
                     )
 
             # ─── وضع البرومبت ───
