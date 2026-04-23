@@ -80,7 +80,7 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ═══════════════════════════════════════
         if LOGIN_EMAIL and LOGIN_PASSWORD:
             try:
-                # محاولة إغلاق أي Popup ترحيبي
+                # إغلاق أي Popup ترحيبي
                 for sel in [
                     "button:has-text('Close')",
                     "[aria-label='Close']",
@@ -91,70 +91,90 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if el:
                         try:
                             await el.click()
-                            await asyncio.sleep(0.3)
+                            await page.wait_for_timeout(300)
                         except Exception:
                             pass
 
-                # البحث عن زر Log in
+                # البحث عن زر Log in العلوي
                 login_btn = None
                 for sel in [
-                    "button:has-text('Log in')",
-                    "a:has-text('Log in')",
-                    "[data-testid='login-button']",
-                    "button >> text=/Log\\s*in/i",
+                    'text=Log in',
+                    'button:has-text("Log in")',
+                    'a:has-text("Log in")',
+                    '[data-testid="login-button"]',
                 ]:
                     login_btn = await page.query_selector(sel)
-                    if login_btn:
+                    if login_btn and await login_btn.is_visible():
                         break
 
-                if login_btn:
-                    await status_msg.edit_text("🔐 تم العثور على زر Log in، جاري الضغط...")
+                if not login_btn:
+                    await status_msg.edit_text("ℹ️ لا يوجد زر Log in مرئي، البث سيبدأ مباشرة...")
+                else:
+                    await status_msg.edit_text("🔐 تم العثور على زر Log in، جاري فتح نموذج Sign in...")
                     await login_btn.click()
 
-                    # انتظار ظهور نموذج تسجيل الدخول
+                    # انتظار ظهور نموذج Sign in (حقل البريد)
                     await page.wait_for_selector(
-                        "input[type='email'], input[name='email'], input[placeholder*='mail' i], #email",
-                        timeout=8000,
+                        'input[name="email"], input[type="email"]',
+                        timeout=10000,
+                        state="visible",
                     )
+
+                    await status_msg.edit_text("🔐 جاري إدخال البريد وكلمة المرور...")
 
                     # ملء البريد
-                    email_input = await page.query_selector(
-                        "input[type='email'], input[name='email'], input[placeholder*='mail' i], #email"
+                    await page.fill(
+                        'input[name="email"], input[type="email"]',
+                        LOGIN_EMAIL,
                     )
-                    if email_input:
-                        await email_input.fill(LOGIN_EMAIL)
-
                     # ملء كلمة المرور
-                    pass_input = await page.query_selector(
-                        "input[type='password'], input[name='password'], input[placeholder*='password' i], #password"
+                    await page.fill(
+                        'input[name="password"], input[type="password"]',
+                        LOGIN_PASSWORD,
                     )
-                    if pass_input:
-                        await pass_input.fill(LOGIN_PASSWORD)
 
-                    # الضغط على زر الإرسال
-                    submit_btn = await page.query_selector(
-                        "button[type='submit'], button:has-text('Log in'), button:has-text('Sign in'), button:has-text('Login')"
+                    # الضغط على Enter داخل حقل الباسورد (يُرسِّل النموذج)
+                    await page.press(
+                        'input[name="password"], input[type="password"]',
+                        "Enter",
                     )
-                    if submit_btn:
-                        await submit_btn.click()
 
-                    # انتظار اكتمال تسجيل الدخول
-                    await page.wait_for_timeout(3000)
-                    await page.wait_for_load_state("networkidle")
-
-                    login_performed = True
-                    await status_msg.edit_text("✅ تم تسجيل الدخول بنجاح! جاري بدء البث...")
-                else:
-                    await status_msg.edit_text("ℹ️ لا يوجد زر Log in، البث سيبدأ مباشرة...")
+                    # انتظار اختفاء حقل البريد كدليل على اجتياز تسجيل الدخول
+                    try:
+                        await page.wait_for_selector(
+                            'input[name="email"], input[type="email"]',
+                            timeout=15000,
+                            state="detached",
+                        )
+                        login_performed = True
+                        await status_msg.edit_text("✅ تم تسجيل الدخول بنجاح! جاري بدء البث...")
+                    except PlaywrightTimeout:
+                        # fallback: ربما أصبح hidden بدلاً من detached
+                        still_visible = await page.is_visible(
+                            'input[name="email"], input[type="email"]'
+                        )
+                        if not still_visible:
+                            login_performed = True
+                            await status_msg.edit_text("✅ تم تسجيل الدخول بنجاح! جاري بدء البث...")
+                        else:
+                            raise RuntimeError(
+                                "بقي نموذج تسجيل الدخول ظاهراً بعد الضغط على Enter"
+                            )
 
             except PlaywrightTimeout:
-                logger.warning("انتهى الوقت أثناء محاولة تسجيل الدخول، سيتم البث دون تسجيل.")
-                await status_msg.edit_text("⚠️ لم يُكتمل تسجيل الدخول (انتهى الوقت)، البث سيبدأ...")
+                logger.warning("انتهى الوقت أثناء محاولة تسجيل الدخول.")
+                await status_msg.edit_text(
+                    "⚠️ انتهى الوقت أثناء تسجيل الدخول، البث سيبدأ بدونه..."
+                )
             except Exception as e:
                 logger.warning(f"خطأ أثناء تسجيل الدخول: {e}")
-                await status_msg.edit_text(f"⚠️ خطأ في تسجيل الدخول ({e})، سيبدأ البث على أي حال.")
+                await status_msg.edit_text(
+                    f"⚠️ فشل تسجيل الدخول ({e})، سيبدأ البث على أي حال."
+                )
         else:
-            await status_msg.edit_text("ℹ️ لم تُضف بيانات LOGIN_EMAIL/LOGIN_PASSWORD، البث بدون تسجيل دخول.")
+            await status_msg.edit_text(
+                "ℹ️ لم تُضف بيانات LOGIN_EMAIL/LOGIN_PASSWORD، البث بدون تسجيل دخول."
+            )
 
         # ─── أول لقطة بعد تسجيل الدخول (أو بدونه) ───
         first_screenshot = await page.screenshot(type="jpeg", quality=80)
@@ -180,15 +200,17 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "task": task,
             }
 
-        if login_performed:
-            await status_msg.edit_text("✅ البث يعمل الآن بعد تسجيل الدخول! 🎥")
-        else:
-            await status_msg.edit_text("✅ تم بدء البث! 🎥\nسأُحدّث نفس الرسالة كل 3 ثوانٍ.")
+        if not login_performed:
+            await status_msg.edit_text(
+                "✅ تم بدء البث! 🎥\nسأُحدّث نفس الرسالة كل 3 ثوانٍ."
+            )
 
     except Exception as e:
         logger.exception("Error starting stream")
         try:
-            await status_msg.edit_text(f"❌ فشل بدء البث:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(
+                f"❌ فشل بدء البث:\n`{e}`", parse_mode=ParseMode.MARKDOWN
+            )
         except Exception:
             pass
 
@@ -260,7 +282,7 @@ async def broadcast_loop(
                 )
             except BadRequest as e:
                 if "Message is not modified" in str(e):
-                    pass  # تجاهل، ليست مشكلة
+                    pass
                 else:
                     logger.warning(f"BadRequest in broadcast: {e}")
             except Exception as e:
@@ -280,7 +302,6 @@ async def broadcast_loop(
         except Exception:
             pass
     finally:
-        # ضمان التنظيف حتى لو لم يُضغط /stop
         await cleanup_stream(chat_id)
 
 
