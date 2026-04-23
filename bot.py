@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import tempfile
 from io import BytesIO
 from telegram import (
     Update,
@@ -123,18 +124,28 @@ async def broadcast_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             page = streams[chat_id]["page"]
             msg_id = streams[chat_id]["message_id"]
 
-            # التقاط لقطة
-            screenshot = await page.screenshot(type="jpeg", quality=80)
+            # 1. التقاط لقطة
+            screenshot_bytes = await page.screenshot(type="jpeg", quality=80)
 
-            # ✅ التصحيح: استخدام InputMediaPhoto بدلاً من InputFile مباشرة
-            await context.bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=msg_id,
-                media=InputMediaPhoto(
-                    media=InputFile(BytesIO(screenshot), filename="live.jpg"),
-                    caption="📡 لقطة مباشرة · مُحدّثة الآن",
-                ),
-            )
+            # 2. حفظها في ملف مؤقت (ضروري لـ edit_message_media)
+            tmp_path = f"/tmp/live_{chat_id}.jpg"
+            with open(tmp_path, "wb") as f:
+                f.write(screenshot_bytes)
+
+            try:
+                # ✅ التصحيح: استخدام مسار ملف حقيقي مع InputFile
+                await context.bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    media=InputMediaPhoto(
+                        media=InputFile(tmp_path),
+                        caption="📡 لقطة مباشرة · مُحدّثة الآن",
+                    ),
+                )
+            finally:
+                # حذف الملف المؤقت لتوفير المساحة
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
             await asyncio.sleep(3)
 
@@ -142,7 +153,10 @@ async def broadcast_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Stream cancelled for {chat_id}")
     except Exception as e:
         logger.error(f"Stream error: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ توقف البث بسبب خطأ: {e}")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚠️ توقف البث بسبب خطأ: {e}")
+        except Exception:
+            pass
     finally:
         await cleanup_stream(chat_id)
 
