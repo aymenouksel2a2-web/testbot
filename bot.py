@@ -1,50 +1,25 @@
 import os
 import re
-import asyncio
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from requests_html import HTMLSession
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- إعداد مسار متصفحات Playwright ---
-# هذا يضمن استخدام المسار الذي سنثبته في nixpacks.toml
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/app/.playwright-browsers")
-
+# --- إعدادات ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# --- دالة استخراج النص باستخدام Playwright ---
-async def extract_text_with_playwright(url: str) -> str:
+# --- دالة الاستخراج باستخدام requests-html (تدعم JavaScript) ---
+def extract_text_with_requests_html(url: str) -> str:
     """
-    تستخدم Playwright لتحميل الصفحة واستخراج النص الكامل، بما في ذلك المحتوى الديناميكي.
+    تستخدم requests-html لتحميل الصفحة وتنفيذ JavaScript ثم استخراج النص.
     """
+    session = HTMLSession()
     try:
-        async with async_playwright() as p:
-            # تشغيل المتصفح بدون واجهة مع وسائط لتقليل استهلاك الذاكرة
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--single-process',           # يقلل استخدام الذاكرة
-                    '--disable-software-rasterizer'
-                ]
-            )
-            page = await browser.new_page()
-            
-            # الانتقال إلى الرابط وانتظار تحميل الشبكة
-            await page.goto(url, wait_until='networkidle')
-            
-            # انتظار إضافي لتحميل أي محتوى ديناميكي (3 ثوانٍ)
-            await page.wait_for_timeout(3000)
-            
-            # الحصول على HTML الكامل بعد التحميل
-            html_content = await page.content()
-            await browser.close()
+        # جلب الصفحة مع انتظار تحميل JavaScript (timeout=20 ثانية)
+        r = session.get(url)
+        r.html.render(timeout=20, sleep=3)  # sleep=3 ينتظر 3 ثوانٍ بعد التحميل
         
-        # تحليل HTML باستخدام BeautifulSoup
-        soup = BeautifulSoup(html_content, 'html.parser')
-        all_text = soup.get_text(separator='\n', strip=True)
+        # استخراج النص الكامل
+        all_text = r.html.text
         
         # البحث عن وقت المختبر بصيغة HH:MM:SS
         time_pattern = r'\b\d{1,2}:\d{2}:\d{2}\b'
@@ -55,9 +30,10 @@ async def extract_text_with_playwright(url: str) -> str:
             return f"⏱️ وقت المختبر: {lab_time}\n\n{all_text}"
         else:
             return f"⚠️ لم يتم العثور على وقت محدد.\n\n{all_text}"
-            
     except Exception as e:
         return f"❌ فشل استخراج النص: {e}"
+    finally:
+        session.close()
 
 # --- دوال تيليجرام ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -73,10 +49,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = re.findall(url_pattern, user_text)
     
     if urls:
-        await update.message.reply_text("⏳ جاري استخراج النص من الرابط باستخدام Playwright، قد يستغرق ذلك دقيقة...")
+        await update.message.reply_text("⏳ جاري استخراج النص من الرابط... قد يستغرق ذلك 20-30 ثانية.")
         
         url = urls[0]
-        extracted_text = await extract_text_with_playwright(url)
+        # تشغيل الدالة في thread منفصل لأنها دالة عادية (غير async)
+        extracted_text = await asyncio.to_thread(extract_text_with_requests_html, url)
         
         max_length = 4096
         if len(extracted_text) > max_length:
@@ -92,12 +69,14 @@ def main():
         print("❌ خطأ: لم يتم تعيين TELEGRAM_BOT_TOKEN في متغيرات البيئة.")
         return
     
+    # إضافة drop_pending_updates لتجنب خطأ التعارض "Conflict: terminated by other getUpdates request"
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("🤖 البوت يعمل الآن...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)  # <-- هذا يحل مشكلة التعارض
 
 if __name__ == "__main__":
+    import asyncio
     main()
