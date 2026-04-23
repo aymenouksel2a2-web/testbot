@@ -1,25 +1,59 @@
 import os
 import re
-from requests_html import HTMLSession
+import time
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- إعدادات ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# --- دالة الاستخراج باستخدام requests-html (تدعم JavaScript) ---
-def extract_text_with_requests_html(url: str) -> str:
+# --- دالة الاستخراج باستخدام Selenium (متزامنة) ---
+def extract_text_with_selenium(url: str) -> str:
     """
-    تستخدم requests-html لتحميل الصفحة وتنفيذ JavaScript ثم استخراج النص.
+    تستخدم Selenium لتحميل الصفحة واستخراج النص الكامل، بما في ذلك المحتوى الديناميكي.
+    تعمل بشكل متزامن (synchronous) لتجنب مشاكل asyncio.
     """
-    session = HTMLSession()
+    driver = None
     try:
-        # جلب الصفحة مع انتظار تحميل JavaScript (timeout=20 ثانية)
-        r = session.get(url)
-        r.html.render(timeout=20, sleep=3)  # sleep=3 ينتظر 3 ثوانٍ بعد التحميل
+        # إعداد خيارات Chrome
+        chrome_options = Options()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        chrome_options.add_experimental_option('useAutomationExtension', False)
         
-        # استخراج النص الكامل
-        all_text = r.html.text
+        # استخدام ChromeDriver المثبت تلقائياً عبر webdriver-manager
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        
+        # تحميل الصفحة
+        driver.get(url)
+        
+        # انتظار تحميل المحتوى الأساسي (حتى يظهر body)
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        # انتظار إضافي للـ JavaScript
+        time.sleep(3)
+        
+        # الحصول على HTML الكامل بعد التحميل
+        page_html = driver.page_source
+        
+        # تحليل HTML باستخدام BeautifulSoup
+        soup = BeautifulSoup(page_html, 'html.parser')
+        all_text = soup.get_text(separator='\n', strip=True)
         
         # البحث عن وقت المختبر بصيغة HH:MM:SS
         time_pattern = r'\b\d{1,2}:\d{2}:\d{2}\b'
@@ -33,7 +67,8 @@ def extract_text_with_requests_html(url: str) -> str:
     except Exception as e:
         return f"❌ فشل استخراج النص: {e}"
     finally:
-        session.close()
+        if driver:
+            driver.quit()
 
 # --- دوال تيليجرام ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -52,8 +87,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ جاري استخراج النص من الرابط... قد يستغرق ذلك 20-30 ثانية.")
         
         url = urls[0]
-        # تشغيل الدالة في thread منفصل لأنها دالة عادية (غير async)
-        extracted_text = await asyncio.to_thread(extract_text_with_requests_html, url)
+        # تشغيل دالة Selenium المتزامنة في thread منفصل بدون مشاكل event loop
+        import asyncio
+        loop = asyncio.get_event_loop()
+        extracted_text = await loop.run_in_executor(None, extract_text_with_selenium, url)
         
         max_length = 4096
         if len(extracted_text) > max_length:
@@ -69,14 +106,13 @@ def main():
         print("❌ خطأ: لم يتم تعيين TELEGRAM_BOT_TOKEN في متغيرات البيئة.")
         return
     
-    # إضافة drop_pending_updates لتجنب خطأ التعارض "Conflict: terminated by other getUpdates request"
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     print("🤖 البوت يعمل الآن...")
-    app.run_polling(drop_pending_updates=True)  # <-- هذا يحل مشكلة التعارض
+    # drop_pending_updates=True لحل مشكلة تعارض الجلسات
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    import asyncio
     main()
