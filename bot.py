@@ -133,33 +133,40 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         LOGIN_PASSWORD,
                     )
 
-                    # الضغط على Enter داخل حقل الباسورد (يُرسِّل النموذج)
-                    await page.press(
-                        'input[name="password"], input[type="password"]',
-                        "Enter",
+                    # ─── الضغط على زر Sign in أو Enter + انتظار الانتقال ───
+                    sign_in_btn = await page.query_selector(
+                        'button:has-text("Sign in"), button[type="submit"]'
                     )
 
-                    # انتظار اختفاء حقل البريد كدليل على اجتياز تسجيل الدخول
-                    try:
-                        await page.wait_for_selector(
-                            'input[name="email"], input[type="email"]',
-                            timeout=15000,
-                            state="detached",
-                        )
-                        login_performed = True
-                        await status_msg.edit_text("✅ تم تسجيل الدخول بنجاح! جاري بدء البث...")
-                    except PlaywrightTimeout:
-                        # fallback: ربما أصبح hidden بدلاً من detached
-                        still_visible = await page.is_visible(
-                            'input[name="email"], input[type="email"]'
-                        )
-                        if not still_visible:
-                            login_performed = True
-                            await status_msg.edit_text("✅ تم تسجيل الدخول بنجاح! جاري بدء البث...")
-                        else:
-                            raise RuntimeError(
-                                "بقي نموذج تسجيل الدخول ظاهراً بعد الضغط على Enter"
+                    if sign_in_btn and await sign_in_btn.is_visible():
+                        await status_msg.edit_text("🔐 جاري الضغط على زر Sign in وانتظار الدخول...")
+                        async with page.expect_navigation(
+                            wait_until="networkidle", timeout=15000
+                        ):
+                            await sign_in_btn.click()
+                    else:
+                        await status_msg.edit_text("🔐 جاري إرسال النموذج (Enter) وانتظار الدخول...")
+                        async with page.expect_navigation(
+                            wait_until="networkidle", timeout=15000
+                        ):
+                            await page.press(
+                                'input[name="password"], input[type="password"]',
+                                "Enter",
                             )
+
+                    # التحقق من نجاح الدخول: حقل الـ email يجب ألا يكون ظاهراً
+                    email_still_visible = await page.is_visible(
+                        'input[name="email"], input[type="email"]'
+                    )
+                    if email_still_visible:
+                        raise RuntimeError(
+                            "ما زال نموذج تسجيل الدخول ظاهراً (بيانات خاطئة؟)"
+                        )
+
+                    login_performed = True
+                    await status_msg.edit_text(
+                        "✅ تم تسجيل الدخول بنجاح وتم الوصول إلى الصفحة! جاري بدء البث..."
+                    )
 
             except PlaywrightTimeout:
                 logger.warning("انتهى الوقت أثناء محاولة تسجيل الدخول.")
@@ -177,6 +184,9 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         # ─── أول لقطة بعد تسجيل الدخول (أو بدونه) ───
+        # ننتظر قليلاً لضمان استقرار الصفحة الجديدة
+        await page.wait_for_timeout(500)
+
         first_screenshot = await page.screenshot(type="jpeg", quality=80)
 
         sent_msg = await context.bot.send_photo(
