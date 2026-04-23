@@ -10,7 +10,7 @@ from telegram import (
 )
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -22,6 +22,10 @@ TOKEN = os.environ.get("BOT_TOKEN")
 URL = "https://gratisfy.xyz/chat"
 PORT = int(os.environ.get("PORT", "8080"))
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+
+# ─── بيانات تسجيل الدخول من متغيرات Railway ───
+LOGIN_EMAIL = os.environ.get("LOGIN_EMAIL")
+LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD")
 
 streams = {}
 
@@ -40,7 +44,7 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ البث يعمل بالفعل! أرسل /stop لإيقافه.")
         return
 
-    await update.message.reply_text(f"⏳ جاري فتح المتصفح والاتصال بـ {URL} ...")
+    status_msg = await update.message.reply_text(f"⏳ جاري فتح المتصفح والاتصال بـ {URL} ...")
 
     try:
         p = await async_playwright().start()
@@ -57,10 +61,74 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
 
-        page = await browser.new_page(viewport={"width": 1280, "height": 720})
+        page = await browser.new_page(viewport={"width": 1280, "height": 720"})
         await page.goto(URL, wait_until="networkidle", timeout=60000)
 
-        # ─── أول لقطة ───
+        # ═══════════════════════════════════════
+        #  🔐 تسجيل الدخول التلقائي (إن وُجد)
+        # ═══════════════════════════════════════
+        login_performed = False
+        if LOGIN_EMAIL and LOGIN_PASSWORD:
+            try:
+                # محاولة إغلاق أي Popup ترحيبي (مثل "Message from Lynx")
+                popup_close = await page.query_selector("button:has-text('Close'), .popup-close, [aria-label='Close']")
+                if popup_close:
+                    await popup_close.click()
+                    await asyncio.sleep(0.5)
+
+                # البحث عن زر Log in في الأعلى (الصورة تُظهره في الزاوية)
+                # نحاول Selectors شائعة: نصوص أو classes
+                login_btn = await page.query_selector(
+                    "text=Log in, button:has-text('Log in'), a:has-text('Log in'), [data-testid='login-button']"
+                )
+
+                if not login_btn:
+                    # محاولة أخرى: ربما النص داخله بأحرف كبيرة/صغيرة مختلفة
+                    login_btn = await page.query_selector("button >> text=/Log\\s*in/i")
+
+                if login_btn:
+                    await status_msg.edit_text("🔐 تم العثور على زر Log in، جاري الضغط...")
+                    await login_btn.click()
+
+                    # انتظار ظهور نموذج تسجيل الدخول
+                    await page.wait_for_selector("input[type='email'], input[name='email'], input[placeholder*='mail' i], #email", timeout=8000)
+
+                    # ملء البريد
+                    email_input = await page.query_selector("input[type='email'], input[name='email'], input[placeholder*='mail' i], #email")
+                    if email_input:
+                        await email_input.fill(LOGIN_EMAIL)
+
+                    # ملء كلمة المرور
+                    pass_input = await page.query_selector("input[type='password'], input[name='password'], input[placeholder*='password' i], #password")
+                    if pass_input:
+                        await pass_input.fill(LOGIN_PASSWORD)
+
+                    # الضغط على زر الإرسال (Submit/Login)
+                    submit_btn = await page.query_selector(
+                        "button[type='submit'], button:has-text('Log in'), button:has-text('Sign in'), button:has-text('Login')"
+                    )
+                    if submit_btn:
+                        await submit_btn.click()
+
+                    # انتظار اكتمال تسجيل الدخول (إما زر Log in يختفي أو تظهر واجهة المحادثة)
+                    await page.wait_for_timeout(3000)  # 3 ثوانٍ كافية عادةً
+                    await page.wait_for_load_state("networkidle")
+
+                    login_performed = True
+                    await status_msg.edit_text("✅ تم تسجيل الدخول بنجاح! جاري بدء البث...")
+                else:
+                    await status_msg.edit_text("ℹ️ لا يوجد زر Log in، البث سيبدأ مباشرة...")
+
+            except PlaywrightTimeout:
+                logger.warning("انتهى الوقت أثناء محاولة تسجيل الدخول، سيتم البث دون تسجيل.")
+                await status_msg.edit_text("⚠️ لم يُكتمل تسجيل الدخول (انتهى الوقت)، البث سيبدأ...")
+            except Exception as e:
+                logger.warning(f"خطأ أثناء تسجيل الدخول: {e}")
+                await status_msg.edit_text(f"⚠️ خطأ في تسجيل الدخول ({e})، سيبدأ البث على أي حال.")
+        else:
+            await status_msg.edit_text("ℹ️ لم تُضف بيانات LOGIN_EMAIL/LOGIN_PASSWORD، البث بدون تسجيل دخول.")
+
+        # ─── أول لقطة بعد تسجيل الدخول (أو بدونه) ───
         first_screenshot = await page.screenshot(type="jpeg", quality=80)
 
         sent_msg = await context.bot.send_photo(
@@ -77,14 +145,17 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "active": True,
         }
 
-        await update.message.reply_text("✅ تم بدء البث! 🎥\nسأُحدّث نفس الرسالة كل 3 ثوانٍ.")
+        if not login_performed:
+            await status_msg.edit_text("✅ تم بدء البث! 🎥\nسأُحدّث نفس الرسالة كل 3 ثوانٍ.")
+        else:
+            await status_msg.edit_text("✅ البث يعمل الآن بعد تسجيل الدخول! 🎥")
 
         task = asyncio.create_task(broadcast_loop(chat_id, context))
         streams[chat_id]["task"] = task
 
     except Exception as e:
         logger.exception("Error starting stream")
-        await update.message.reply_text(f"❌ فشل بدء البث:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        await status_msg.edit_text(f"❌ فشل بدء البث:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -124,16 +195,13 @@ async def broadcast_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             page = streams[chat_id]["page"]
             msg_id = streams[chat_id]["message_id"]
 
-            # 1. التقاط لقطة
             screenshot_bytes = await page.screenshot(type="jpeg", quality=80)
 
-            # 2. حفظها في ملف مؤقت (ضروري لـ edit_message_media)
             tmp_path = f"/tmp/live_{chat_id}.jpg"
             with open(tmp_path, "wb") as f:
                 f.write(screenshot_bytes)
 
             try:
-                # ✅ التصحيح: استخدام مسار ملف حقيقي مع InputFile
                 await context.bot.edit_message_media(
                     chat_id=chat_id,
                     message_id=msg_id,
@@ -143,7 +211,6 @@ async def broadcast_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                     ),
                 )
             finally:
-                # حذف الملف المؤقت لتوفير المساحة
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
