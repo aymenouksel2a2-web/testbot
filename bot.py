@@ -6,30 +6,39 @@ from playwright.async_api import async_playwright
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- الثوابت ---
+# --- إعداد مسار متصفحات Playwright ---
+# هذا يضمن استخدام المسار الذي سنثبته في nixpacks.toml
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/app/.playwright-browsers")
+
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# --- دالة الاستخراج باستخدام Playwright (تعمل بشكل غير متزامن) ---
+# --- دالة استخراج النص باستخدام Playwright ---
 async def extract_text_with_playwright(url: str) -> str:
     """
     تستخدم Playwright لتحميل الصفحة واستخراج النص الكامل، بما في ذلك المحتوى الديناميكي.
     """
     try:
         async with async_playwright() as p:
-            # تشغيل المتصفح بدون واجهة
+            # تشغيل المتصفح بدون واجهة مع وسائط لتقليل استهلاك الذاكرة
             browser = await p.chromium.launch(
                 headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage']
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--single-process',           # يقلل استخدام الذاكرة
+                    '--disable-software-rasterizer'
+                ]
             )
             page = await browser.new_page()
             
-            # الانتقال إلى الرابط وانتظار تحميل الصفحة
+            # الانتقال إلى الرابط وانتظار تحميل الشبكة
             await page.goto(url, wait_until='networkidle')
             
-            # انتظار إضافي لتحميل أي محتوى ديناميكي
+            # انتظار إضافي لتحميل أي محتوى ديناميكي (3 ثوانٍ)
             await page.wait_for_timeout(3000)
             
-            # الحصول على محتوى HTML الكامل بعد التحميل
+            # الحصول على HTML الكامل بعد التحميل
             html_content = await page.content()
             await browser.close()
         
@@ -50,7 +59,7 @@ async def extract_text_with_playwright(url: str) -> str:
     except Exception as e:
         return f"❌ فشل استخراج النص: {e}"
 
-# --- دوال التعامل مع تيليجرام (تبقى كما هي مع تعديل بسيط لاستدعاء الدالة غير المتزامنة) ---
+# --- دوال تيليجرام ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 مرحبًا! أنا بوت استخراج النصوص.\n"
@@ -67,7 +76,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ جاري استخراج النص من الرابط باستخدام Playwright، قد يستغرق ذلك دقيقة...")
         
         url = urls[0]
-        extracted_text = await extract_text_with_playwright(url)  # استدعاء الدالة غير المتزامنة
+        extracted_text = await extract_text_with_playwright(url)
         
         max_length = 4096
         if len(extracted_text) > max_length:
@@ -79,9 +88,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤔 لم أجد رابطًا صالحًا في رسالتك. من فضلك أرسل رابط URL.")
 
 def main():
+    if not TOKEN:
+        print("❌ خطأ: لم يتم تعيين TELEGRAM_BOT_TOKEN في متغيرات البيئة.")
+        return
+    
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
     print("🤖 البوت يعمل الآن...")
     app.run_polling()
 
