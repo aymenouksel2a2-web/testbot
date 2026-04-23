@@ -1,9 +1,12 @@
-
 import os
 import asyncio
 import logging
 from io import BytesIO
-from telegram import Update, InputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update,
+    InputFile,
+    InputMediaPhoto,
+)
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 from playwright.async_api import async_playwright
@@ -19,7 +22,6 @@ URL = "https://gratisfy.xyz/chat"
 PORT = int(os.environ.get("PORT", "8080"))
 RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
 
-# تخزين حالة البث: chat_id -> {browser, page, message_id, active}
 streams = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -57,10 +59,9 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = await browser.new_page(viewport={"width": 1280, "height": 720})
         await page.goto(URL, wait_until="networkidle", timeout=60000)
 
-        # ─── أول لقطة لإرسالها كرسالة أولى ───
+        # ─── أول لقطة ───
         first_screenshot = await page.screenshot(type="jpeg", quality=80)
 
-        # إرسال الصورة الأولى وحفظ message_id
         sent_msg = await context.bot.send_photo(
             chat_id=chat_id,
             photo=InputFile(BytesIO(first_screenshot), filename="live.jpg"),
@@ -77,7 +78,6 @@ async def stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text("✅ تم بدء البث! 🎥\nسأُحدّث نفس الرسالة كل 3 ثوانٍ.")
 
-        # تشغيل حلقة التحديث
         task = asyncio.create_task(broadcast_loop(chat_id, context))
         streams[chat_id]["task"] = task
 
@@ -104,7 +104,6 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_id = streams[chat_id].get("message_id")
     await cleanup_stream(chat_id)
 
-    # تعديل الرسالة الأخيرة لتظهر أن البث توقف
     if msg_id:
         try:
             await context.bot.edit_message_caption(
@@ -117,28 +116,24 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏹️ تم إيقاف البث وتصفية المتصفح.")
 
-# ─── حلقة التحديث: تُعدّل نفس الرسالة ───
+# ─── حلقة التحديث ───
 async def broadcast_loop(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
         while streams.get(chat_id, {}).get("active", False):
             page = streams[chat_id]["page"]
             msg_id = streams[chat_id]["message_id"]
 
-            # التقاط لقطة جديدة
+            # التقاط لقطة
             screenshot = await page.screenshot(type="jpeg", quality=80)
 
-            # تحديث نفس الرسالة بصورة جديدة
+            # ✅ التصحيح: استخدام InputMediaPhoto بدلاً من InputFile مباشرة
             await context.bot.edit_message_media(
                 chat_id=chat_id,
                 message_id=msg_id,
-                media=InputFile(BytesIO(screenshot), filename="live.jpg"),
-            )
-
-            # تحديث الوقت في الكابشن (اختياري)
-            await context.bot.edit_message_caption(
-                chat_id=chat_id,
-                message_id=msg_id,
-                caption="📡 لقطة مباشرة · مُحدّثة الآن",
+                media=InputMediaPhoto(
+                    media=InputFile(BytesIO(screenshot), filename="live.jpg"),
+                    caption="📡 لقطة مباشرة · مُحدّثة الآن",
+                ),
             )
 
             await asyncio.sleep(3)
