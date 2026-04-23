@@ -30,6 +30,128 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "سألتقط صوراً لكي ترى ما يحدث!"
     )
 
+async def find_and_click_login_button(page):
+    """يضغط على زر Log in / Sign in / Login العلوي إذا وجده"""
+    selectors = [
+        'a:has-text("Log in")',
+        'a:has-text("Login")',
+        'a:has-text("Sign in")',
+        'button:has-text("Log in")',
+        'button:has-text("Login")',
+        'button:has-text("Sign in")',
+    ]
+    for sel in selectors:
+        btn = page.locator(sel).first
+        try:
+            if await btn.count() > 0 and await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(2500)
+                return True
+        except Exception:
+            continue
+    return False
+
+async def fill_login_form(page, email: str, password: str):
+    """يملأ نموذج تسجيل الدخول ويضغط الزر الحقيقي"""
+    # ── حقل Email ──
+    email_selectors = [
+        'input[type="email"]',
+        'input[name="email"]',
+        'input[id="email"]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="e-mail" i]',
+        'input[aria-label*="email" i]',
+        'input[inputmode="email"]',
+    ]
+    email_input = None
+    for sel in email_selectors:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count() > 0 and await loc.is_visible():
+                email_input = loc
+                break
+        except Exception:
+            continue
+
+    # ── حقل Password ──
+    pass_selectors = [
+        'input[type="password"]',
+        'input[name="password"]',
+        'input[id="password"]',
+        'input[placeholder*="password" i]',
+        'input[aria-label*="password" i]',
+    ]
+    pass_input = None
+    for sel in pass_selectors:
+        loc = page.locator(sel).first
+        try:
+            if await loc.count() > 0 and await loc.is_visible():
+                pass_input = loc
+                break
+        except Exception:
+            continue
+
+    if not email_input or not pass_input:
+        return False
+
+    await email_input.scroll_into_view_if_needed()
+    await email_input.click()
+    await email_input.fill(email)
+    await page.wait_for_timeout(400)
+
+    await pass_input.scroll_into_view_if_needed()
+    await pass_input.click()
+    await pass_input.fill(password)
+    await page.wait_for_timeout(400)
+
+    # ── النقر على زر الإرسال (أذكى طريقة) ──
+    clicked = False
+
+    # جرب جميع أزرار <button> المرئية وابحث عن النصوص المناسبة
+    all_btns = await page.locator("button").all()
+    for btn in all_btns:
+        try:
+            if not await btn.is_visible():
+                continue
+            txt = await btn.text_content()
+            if txt and any(k in txt.lower() for k in ["sign in", "log in", "login", "submit"]):
+                await btn.click()
+                clicked = True
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        # جرب input[type="submit"]
+        sub = page.locator('input[type="submit"]').first
+        try:
+            if await sub.count() > 0 and await sub.is_visible():
+                await sub.click()
+                clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        # الأخير: اضغط Enter في حقل كلمة المرور
+        await pass_input.press("Enter")
+
+    # ── انتظر الانتقال ──
+    await page.wait_for_timeout(3000)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(2000)
+
+    # ── تحقق: هل اختفت حقول التسجيل؟ ──
+    still_visible = False
+    try:
+        still_visible = await email_input.count() > 0 and await email_input.is_visible()
+    except Exception:
+        pass
+
+    return not still_visible
+
 async def run_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, prompt: str | None, email: str | None = None, password: str | None = None):
     chat_id = update.effective_chat.id
     browser = None
@@ -50,34 +172,29 @@ async def run_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
             # ─── تسجيل الدخول إذا توفرت بيانات ───
             if email and password:
                 await context.bot.send_message(chat_id=chat_id, text="🔐 جاري تسجيل الدخول...")
-                await page.wait_for_timeout(1000)
+                await page.wait_for_timeout(1500)
 
-                login_btn = page.locator('button:has-text("Log in"), a:has-text("Log in"), button:has-text("Login"), a:has-text("Login")').first
-                if await login_btn.count() > 0 and await login_btn.is_visible():
-                    await login_btn.click()
-                    await page.wait_for_timeout(2000)
+                # إذا لم تكن حقول التسجيل ظاهرة مباشرةً، اضغط على زر Log in أولاً
+                has_email = await page.locator('input[type="email"], input[name="email"]').first.count() > 0
+                has_pass = await page.locator('input[type="password"]').first.count() > 0
 
-                email_input = page.locator('input[type="email"]').first
-                if await email_input.count() == 0:
-                    email_input = page.locator('input[name="email"], input[name="username"], input[placeholder*="email" i], input[placeholder*="e-mail" i], input[id*="email" i]').first
+                if not (has_email and has_pass):
+                    await find_and_click_login_button(page)
 
-                pass_input = page.locator('input[type="password"]').first
+                success = await fill_login_form(page, email, password)
 
-                if await email_input.count() > 0 and await pass_input.count() > 0:
-                    await email_input.fill(email)
-                    await pass_input.fill(password)
-
-                    submit_btn = page.locator('button[type="submit"], button:has-text("Log in"), button:has-text("Login"), button:has-text("Sign in"), input[type="submit"]').first
-                    if await submit_btn.count() > 0:
-                        await submit_btn.click()
-                        await page.wait_for_timeout(3000)
-                        await page.wait_for_load_state("networkidle")
-                    else:
-                        await pass_input.press("Enter")
-                        await page.wait_for_timeout(3000)
-                        await page.wait_for_load_state("networkidle")
+                if success:
+                    await context.bot.send_message(chat_id=chat_id, text="✅ تم تسجيل الدخول.")
                 else:
-                    await context.bot.send_message(chat_id=chat_id, text="⚠️ لم أجد حقول تسجيل الدخول التقليدية، سأستمر بالوضع الحالي.")
+                    # أرسل لقطة للمستخدم ليرى ما إذا بقيت في صفحة الدخول
+                    ss = await page.screenshot(type="png", full_page=False)
+                    buf = BytesIO(ss)
+                    buf.name = "login_check.png"
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=buf,
+                        caption="⚠️ ما زلت هنا؟ إذا ظهرت صفحة تسجيل الدخول، فقد تحتاج لتحديث بياناتك أو يتطلب الموقع خطوة إضافية."
+                    )
 
             # ─── وضع البرومبت ───
             if prompt:
@@ -179,21 +296,17 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: s
             await page.goto(url, wait_until="networkidle", timeout=30000)
 
             needs_login = False
-
-            login_btn = page.locator('button:has-text("Log in"), a:has-text("Log in"), button:has-text("Login"), a:has-text("Login")').first
-            try:
-                if await login_btn.count() > 0 and await login_btn.is_visible():
-                    needs_login = True
-            except Exception:
-                pass
-
-            if not needs_login:
-                signup_btn = page.locator('button:has-text("Sign up"), a:has-text("Sign up"), button:has-text("Sign Up")').first
+            for sel in [
+                'a:has-text("Log in")', 'a:has-text("Login")', 'a:has-text("Sign in")',
+                'button:has-text("Log in")', 'button:has-text("Login")', 'button:has-text("Sign in")',
+            ]:
+                btn = page.locator(sel).first
                 try:
-                    if await signup_btn.count() > 0 and await signup_btn.is_visible():
+                    if await btn.count() > 0 and await btn.is_visible():
                         needs_login = True
+                        break
                 except Exception:
-                    pass
+                    continue
 
             if needs_login:
                 await context.bot.send_message(
