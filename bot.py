@@ -12,7 +12,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, BrowserContext
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,10 +34,89 @@ PERSISTENT_DIR = "/tmp/gratisfy-data"
 sessions: Dict[int, Dict[str, Any]] = {}
 sessions_lock: Optional[asyncio.Lock] = None
 
+# ── Global browser context (initialized once on startup) ──
+pw: Optional[Any] = None
+browser_ctx: Optional[BrowserContext] = None
+browser_ready = asyncio.Event()
+
+
+async def initialize_browser():
+    """يُستدعى مرة واحدة عند تشغيل البوت"""
+    global pw, browser_ctx
+
+    pw = await async_playwright().start()
+
+    browser_ctx = await pw.chromium.launch_persistent_context(
+        PERSISTENT_DIR,
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-setuid-sandbox",
+            "--no-first-run",
+            "--no-zygote",
+            "--single-process",
+        ],
+        viewport={"width": 960, "height": 540},
+        locale="en-US",
+    )
+
+    page = await browser_ctx.new_page()
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        window.chrome = { runtime: {} };
+    """)
+
+    await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+    await asyncio.sleep(0.8)
+
+    # إغلاق popups
+    for sel in ["button:has-text('Close')", "[aria-label='Close']", "button.close"]:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=800):
+                await loc.click(timeout=1500)
+                await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+    # تسجيل دخول ذكي
+    if LOGIN_EMAIL and LOGIN_PASSWORD:
+        needs_login = False
+        for sel in ['button:has-text("Log in")', 'a:has-text("Log in")', '[data-testid="login-button"]']:
+            try:
+                loc = page.locator(sel).first
+                await loc.wait_for(state="visible", timeout=3000)
+                needs_login = True
+                break
+            except Exception:
+                continue
+
+        if needs_login:
+            try:
+                await _perform_login(page)
+            except Exception as e:
+                logger.warning(f"Login error: {e}")
+
+        await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(0.8)
+
+    # اختيار النموذج
+    if TARGET_MODEL:
+        await _select_model(page, TARGET_MODEL)
+        await asyncio.sleep(0.3)
+
+    await page.close()
+
+    logger.info("✅ Browser initialized & logged in globally")
+    browser_ready.set()
+
 
 async def post_init(app: Application) -> None:
     global sessions_lock
     sessions_lock = asyncio.Lock()
+    await initialize_browser()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -215,32 +294,14 @@ def _clean_response(text: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Session Worker (يفتح المتصفح مرة واحدة ويحتفظ به)
+#  Session Worker (يفتح صفحة جديدة من الـ Context الجاهز)
 # ═══════════════════════════════════════════════════════════════
 
 async def session_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    pw = None
-    browser_ctx = None
     page = None
 
     try:
-        pw = await async_playwright().start()
-
-        browser_ctx = await pw.chromium.launch_persistent_context(
-            PERSISTENT_DIR,
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-setuid-sandbox",
-                "--no-first-run",
-                "--no-zygote",
-                "--single-process",
-            ],
-            viewport={"width": 960, "height": 540},
-            locale="en-US",
-        )
+        await browser_ready.wait()
 
         page = await browser_ctx.new_page()
         await page.add_init_script("""
@@ -261,28 +322,7 @@ async def session_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # تسجيل دخول ذكي (مرة واحدة فقط بفضل persistent context)
-        if LOGIN_EMAIL and LOGIN_PASSWORD:
-            needs_login = False
-            for sel in ['button:has-text("Log in")', 'a:has-text("Log in")', '[data-testid="login-button"]']:
-                try:
-                    loc = page.locator(sel).first
-                    await loc.wait_for(state="visible", timeout=3000)
-                    needs_login = True
-                    break
-                except Exception:
-                    continue
-
-            if needs_login:
-                try:
-                    await _perform_login(page)
-                except Exception as e:
-                    logger.warning(f"Login error: {e}")
-
-            await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(0.8)
-
-        # اختيار النموذج
+        # اختيار النموذج على الصفحة الجديدة (إذا لزم)
         if TARGET_MODEL:
             await _select_model(page, TARGET_MODEL)
             await asyncio.sleep(0.3)
@@ -315,16 +355,6 @@ async def session_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         if page:
             try:
                 await page.close()
-            except Exception:
-                pass
-        if browser_ctx:
-            try:
-                await browser_ctx.close()
-            except Exception:
-                pass
-        if pw:
-            try:
-                await pw.stop()
             except Exception:
                 pass
         async with sessions_lock:
