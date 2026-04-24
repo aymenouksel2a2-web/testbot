@@ -1,10 +1,12 @@
 import asyncio
 import io
+import json
 import logging
 import os
 import re
 from contextlib import suppress
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.parse import urljoin
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
@@ -60,6 +62,16 @@ RAILWAY_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN")
 LOGIN_EMAIL = os.environ.get("LOGIN_EMAIL")
 LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD")
 TARGET_MODEL = os.environ.get("TARGET_MODEL", "Grok Uncensored")
+
+# إعدادات API الخاصة بـ Gratisfy.
+# الوضع الافتراضي capture يحافظ على البث المرئي: يرسل من واجهة الموقع ثم يقرأ رد /api/chat من الشبكة.
+# direct يرسل إلى /api/chat مباشرة من داخل الصفحة إذا تعطلت واجهة الإدخال.
+# dom يعود للطريقة القديمة كحل احتياطي فقط.
+GRATISFY_API_URL = os.environ.get("GRATISFY_API_URL", urljoin(URL, "/api/chat"))
+GRATISFY_PROVIDER = os.environ.get("GRATISFY_PROVIDER", "navy")
+GRATISFY_MODEL_ID = os.environ.get("GRATISFY_MODEL_ID", "grok-uncensored")
+GRATISFY_SEND_MODE = os.environ.get("GRATISFY_SEND_MODE", "capture").strip().lower()
+API_TIMEOUT = env_int("API_TIMEOUT", 120, minimum=10)
 
 STREAM_INTERVAL = env_int("STREAM_INTERVAL", 3, minimum=2)
 PERSISTENT_DIR = os.environ.get("PERSISTENT_DIR", "/tmp/gratisfy-data")
@@ -868,6 +880,309 @@ async def extract_response(
     return last_text.strip()
 
 
+
+# ═══════════════════════════════════════════════════════════════
+#  Gratisfy API / SSE
+# ═══════════════════════════════════════════════════════════════
+
+class GratisfyAPIError(RuntimeError):
+    """خطأ واضح عند فشل قراءة /api/chat."""
+
+
+def is_gratisfy_api_response(response: Any) -> bool:
+    """يميز استجابة POST الخاصة بالدردشة."""
+    try:
+        return (
+            response.request.method.upper() == "POST"
+            and "/api/chat" in response.url
+        )
+    except Exception:
+        return False
+
+
+def build_gratisfy_payload(text: str) -> Dict[str, Any]:
+    """يبني نفس payload الظاهر في DevTools."""
+    return {
+        "model": GRATISFY_MODEL_ID,
+        "provider": GRATISFY_PROVIDER,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                ],
+            }
+        ],
+    }
+
+
+def parse_gratisfy_sse(raw_text: str) -> str:
+    """يجمع delta.content من استجابة text/event-stream.
+
+    مثال السطور:
+    data: {"choices":[{"delta":{"content":"hello"}}]}
+    data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+    data: {"choices":[],"usage":{...}}
+    """
+    parts: List[str] = []
+
+    for raw_line in str(raw_text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            logger.debug("Ignoring non-json SSE line: %s", data[:200])
+            continue
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list):
+            continue
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+
+            delta = choice.get("delta")
+            if isinstance(delta, dict):
+                content = delta.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+
+            # بعض السيرفرات قد تعيد الرد دفعة واحدة في message.content.
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+
+    return "".join(parts).strip()
+
+
+async def read_api_response_body(response: Any, timeout_sec: int = API_TIMEOUT) -> str:
+    """ينتظر انتهاء stream ثم يحوله إلى نص."""
+    try:
+        status = response.status
+        body = await asyncio.wait_for(response.text(), timeout=timeout_sec)
+    except asyncio.TimeoutError as exc:
+        raise GratisfyAPIError("انتهت مهلة قراءة stream من /api/chat") from exc
+    except Exception as exc:
+        raise GratisfyAPIError(f"تعذرت قراءة استجابة /api/chat: {exc}") from exc
+
+    if status != 200:
+        snippet = (body or "").strip().replace("\n", " ")[:300]
+        raise GratisfyAPIError(f"/api/chat أعاد status {status}: {snippet}")
+
+    answer = parse_gratisfy_sse(body)
+    if not answer:
+        snippet = (body or "").strip().replace("\n", " ")[:300]
+        raise GratisfyAPIError(f"وصل stream من /api/chat لكن لم أجد delta.content. بداية الرد: {snippet}")
+
+    return answer
+
+
+async def submit_prompt_and_capture_api_response(
+    page: Any,
+    text: str,
+    timeout_sec: int = API_TIMEOUT,
+) -> str:
+    """يرسل السؤال من الواجهة ثم يقرأ رد /api/chat مباشرة من الشبكة.
+
+    هذه هي الطريقة الأفضل هنا لأنها تحافظ على البث المرئي في Telegram، لكنها لا
+    تعتمد على DOM لاستخراج الرد. ما دام الموقع نفسه أرسل POST إلى /api/chat،
+    نقرأ body الخاص بالـ text/event-stream ونجمع delta.content.
+    """
+    response_task = asyncio.create_task(
+        page.wait_for_response(
+            is_gratisfy_api_response,
+            timeout=timeout_sec * 1000,
+        )
+    )
+
+    try:
+        await submit_prompt(page, text)
+        response = await response_task
+        return await read_api_response_body(response, timeout_sec=timeout_sec)
+    except Exception:
+        if not response_task.done():
+            response_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await response_task
+        raise
+
+
+async def ask_gratisfy_api_direct(
+    page: Any,
+    text: str,
+    timeout_sec: int = API_TIMEOUT,
+) -> str:
+    """يرسل الطلب مباشرة إلى /api/chat من داخل صفحة Gratisfy.
+
+    نستخدم page.evaluate/fetch حتى يتم الطلب بنفس Origin وCookies الخاصة بالصفحة.
+    هذا مفيد إذا تعطلت أزرار الواجهة، لكنه لن يرسم السؤال والرد في صفحة البث.
+    """
+    payload = build_gratisfy_payload(text)
+    result = await asyncio.wait_for(
+        page.evaluate(
+            """async ({ apiUrl, payload, timeoutMs }) => {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+                try {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {
+                            'accept': 'text/event-stream',
+                            'content-type': 'application/json'
+                        },
+                        body: JSON.stringify(payload),
+                        signal: controller.signal
+                    });
+
+                    const contentType = response.headers.get('content-type') || '';
+                    const decoder = new TextDecoder();
+
+                    if (!response.ok) {
+                        const errorText = await response.text().catch(() => '');
+                        return {
+                            ok: false,
+                            status: response.status,
+                            contentType,
+                            error: errorText.slice(0, 1000)
+                        };
+                    }
+
+                    if (!response.body) {
+                        const text = await response.text();
+                        return { ok: true, status: response.status, contentType, raw: text, answer: '' };
+                    }
+
+                    const reader = response.body.getReader();
+                    let buffer = '';
+                    let answer = '';
+                    let raw = '';
+
+                    const consumeLine = (line) => {
+                        line = String(line || '').trim();
+                        if (!line.startsWith('data:')) return;
+                        const data = line.slice(5).trim();
+                        if (!data || data === '[DONE]') return;
+                        raw += line + '\n';
+                        try {
+                            const obj = JSON.parse(data);
+                            const choices = Array.isArray(obj.choices) ? obj.choices : [];
+                            for (const choice of choices) {
+                                const delta = choice && choice.delta;
+                                if (delta && typeof delta.content === 'string') {
+                                    answer += delta.content;
+                                }
+                                const message = choice && choice.message;
+                                if (message && typeof message.content === 'string') {
+                                    answer += message.content;
+                                }
+                            }
+                        } catch (_) {}
+                    };
+
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (value) {
+                            buffer += decoder.decode(value, { stream: !done });
+                            const lines = buffer.split(/\r?\n/);
+                            buffer = lines.pop() || '';
+                            for (const line of lines) consumeLine(line);
+                        }
+                        if (done) break;
+                    }
+
+                    if (buffer.trim()) consumeLine(buffer);
+                    return { ok: true, status: response.status, contentType, raw, answer };
+                } catch (error) {
+                    return {
+                        ok: false,
+                        status: 0,
+                        error: error && error.message ? error.message : String(error)
+                    };
+                } finally {
+                    clearTimeout(timer);
+                }
+            }""",
+            {
+                "apiUrl": GRATISFY_API_URL,
+                "payload": payload,
+                "timeoutMs": timeout_sec * 1000,
+            },
+        ),
+        timeout=timeout_sec + 5,
+    )
+
+    if not isinstance(result, dict):
+        raise GratisfyAPIError("استجابة fetch غير مفهومة من /api/chat")
+
+    if not result.get("ok"):
+        status = result.get("status")
+        error = str(result.get("error") or "").strip().replace("\n", " ")[:300]
+        raise GratisfyAPIError(f"فشل طلب /api/chat المباشر، status={status}: {error}")
+
+    answer = str(result.get("answer") or "").strip()
+    if not answer:
+        raw = str(result.get("raw") or "")
+        answer = parse_gratisfy_sse(raw)
+
+    if not answer:
+        raw = str(result.get("raw") or "").strip().replace("\n", " ")[:300]
+        raise GratisfyAPIError(f"/api/chat أعاد stream فارغاً أو غير مفهوم: {raw}")
+
+    return answer.strip()
+
+
+async def ask_gratisfy(
+    page: Any,
+    text: str,
+    before_snapshot: Optional[Dict[str, List[str]]] = None,
+    timeout_sec: int = API_TIMEOUT,
+) -> str:
+    """نقطة موحدة لإرسال السؤال حسب الوضع المختار."""
+    mode = GRATISFY_SEND_MODE
+    if mode not in {"capture", "direct", "dom"}:
+        logger.warning("Unknown GRATISFY_SEND_MODE=%s; using capture", mode)
+        mode = "capture"
+
+    if mode == "direct":
+        return await ask_gratisfy_api_direct(page, text, timeout_sec=timeout_sec)
+
+    if mode == "dom":
+        await submit_prompt(page, text)
+        return await extract_response(
+            page,
+            text,
+            before_lines=before_snapshot,
+            timeout_sec=timeout_sec,
+        )
+
+    # الوضع الافتراضي: أرسل من الواجهة، ثم اقرأ stream من network response.
+    try:
+        return await submit_prompt_and_capture_api_response(page, text, timeout_sec=timeout_sec)
+    except Exception as exc:
+        logger.warning("API capture failed, falling back to DOM extraction: %s", exc)
+        # إذا أرسلنا السؤال فعلاً وفشل فقط التقاط الاستجابة، جرّب DOM حتى لا يضيع الرد.
+        dom_response = await extract_response(
+            page,
+            text,
+            before_lines=before_snapshot,
+            timeout_sec=min(timeout_sec, 45),
+        )
+        if dom_response:
+            return dom_response
+        raise
+
 # ═══════════════════════════════════════════════════════════════
 #  Handlers
 # ═══════════════════════════════════════════════════════════════
@@ -967,15 +1282,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             status_msg = await update.message.reply_text("⏳ جاري إرسال السؤال...")
             before_snapshot = await get_visible_text_snapshot(page)
 
-            await submit_prompt(page, text)
-            await edit_status(status_msg, "⏳ تم الإرسال، بانتظار الرد...")
-
-            response = await extract_response(
+            await edit_status(status_msg, "⏳ أرسل السؤال وأقرأ stream من /api/chat...")
+            response = await ask_gratisfy(
                 page,
                 text,
-                before_lines=before_snapshot,
-                timeout_sec=120,
+                before_snapshot=before_snapshot,
+                timeout_sec=API_TIMEOUT,
             )
+            response = clean_response_text(response)
 
             with suppress(TelegramError):
                 await status_msg.delete()
