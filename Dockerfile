@@ -4,15 +4,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium
 
 COPY . .
-
-ENV PORT=8080
-ENV PYTHONUNBUFFERED=1
-
-RUN mkdir -p /tmp/gratisfy-data && chown -R pwuser:pwuser /tmp/gratisfy-data
-
-USER pwuser
 
 CMD ["python", "bot.py"]
