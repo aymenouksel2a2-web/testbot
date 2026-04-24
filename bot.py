@@ -113,6 +113,11 @@ UI_JUNK_EXACT = {
     "start a conversation",
     "web search",
     "reason",
+    "gratisfy",
+    "new chat",
+    "login",
+    "log in",
+    "sign in",
 }
 
 UI_JUNK_CONTAINS = (
@@ -123,12 +128,17 @@ UI_JUNK_CONTAINS = (
     "attach file",
     "message grok",
     "for new line",
+    "to send",
+    "new line",
+    "record",
 )
 
 METRIC_PATTERNS = (
     re.compile(r"^\d+(?:\.\d+)?\s*s$", re.IGNORECASE),
     re.compile(r"^\d+(?:\.\d+)?\s*tok/s$", re.IGNORECASE),
     re.compile(r"^\d+\s*tokens?$", re.IGNORECASE),
+    re.compile(r"^\d+(?:\.\d+)?\s*s\s+\d+(?:\.\d+)?\s*tok/s\s+\d+\s*tokens?$", re.IGNORECASE),
+    re.compile(r"^\d+(?:\.\d+)?\s*s.*?tok/s.*?tokens?$", re.IGNORECASE),
 )
 
 
@@ -213,21 +223,85 @@ async def edit_status(message: Optional[Message], text: str) -> None:
         await message.edit_text(text)
 
 
-async def get_visible_lines(page: Any) -> List[str]:
+async def get_visible_text_snapshot(page: Any) -> Dict[str, List[str]]:
+    """يجمع النص الظاهر بأكثر من طريقة.
+
+    بعض صفحات Gratisfy لا تُرتب رسائل الدردشة في document.body.innerText بنفس
+    ترتيب ظهورها في الشاشة، وأحياناً تكون الرسالة الجديدة داخل عنصر منفصل لا يظهر
+    جيداً عند الاعتماد على body فقط. لذلك نجمع:
+    1) أسطر body.innerText.
+    2) كتل نصية من العناصر المرئية ذات الصلة بالدردشة.
+    """
     try:
         result = await page.evaluate(
             """() => {
-                const raw = document.body?.innerText || '';
-                return raw.split('\n').map(line => line.trim()).filter(Boolean);
+                const normalize = (value) => (value || '')
+                    .replace(/\u00a0/g, ' ')
+                    .replace(/[ \t]+/g, ' ')
+                    .trim();
+
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) {
+                        return false;
+                    }
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+
+                const bodyText = document.body?.innerText || '';
+                const bodyLines = bodyText
+                    .split('\n')
+                    .map(normalize)
+                    .filter(Boolean);
+
+                const selectors = [
+                    'article',
+                    '[role="article"]',
+                    '[data-message-author-role]',
+                    '[data-testid*="message" i]',
+                    '[class*="message" i]',
+                    '[class*="chat" i]',
+                    '[class*="markdown" i]',
+                    '[class*="prose" i]',
+                    'main p', 'main li', 'main pre', 'main code', 'main blockquote',
+                    'main div', 'main span'
+                ].join(',');
+
+                const seen = new Set();
+                const blocks = [];
+                for (const el of document.querySelectorAll(selectors)) {
+                    if (!visible(el)) continue;
+                    const text = normalize(el.innerText || el.textContent || '');
+                    if (!text || text.length < 2 || text.length > 5000) continue;
+                    if (seen.has(text)) continue;
+                    seen.add(text);
+                    blocks.push(text);
+                    if (blocks.length >= 350) break;
+                }
+
+                return { bodyLines, blocks };
             }"""
         )
     except Exception as exc:
-        logger.warning("Failed to read page text: %s", exc)
-        return []
+        logger.warning("Failed to read visible page text: %s", exc)
+        return {"bodyLines": [], "blocks": []}
 
-    if not isinstance(result, list):
-        return []
-    return [str(item) for item in result]
+    if not isinstance(result, dict):
+        return {"bodyLines": [], "blocks": []}
+
+    body_lines = result.get("bodyLines") if isinstance(result.get("bodyLines"), list) else []
+    blocks = result.get("blocks") if isinstance(result.get("blocks"), list) else []
+    return {
+        "bodyLines": [str(item) for item in body_lines],
+        "blocks": [str(item) for item in blocks],
+    }
+
+
+async def get_visible_lines(page: Any) -> List[str]:
+    snapshot = await get_visible_text_snapshot(page)
+    return snapshot.get("bodyLines", [])
 
 
 async def wait_for_any_visible(
@@ -523,77 +597,273 @@ async def submit_prompt(page: Any, text: str) -> None:
     await input_box.press("Enter")
 
 
-def build_response_candidate(
-    current_lines: Sequence[str],
-    user_text: str,
-    before_lines: Optional[Sequence[str]] = None,
-) -> str:
-    current = filter_ui_lines(current_lines)
-    before = filter_ui_lines(before_lines or [])
+def is_user_echo(line: str, user_text: str) -> bool:
+    line_norm = normalize_line(line)
     user_norm = normalize_line(user_text)
+    if not line_norm or not user_norm:
+        return False
+    if line_norm == user_norm:
+        return True
+    # لا نحذف الأسطر القصيرة بالاحتواء حتى لا نحذف رداً مثل "hello" بالخطأ.
+    if len(user_norm) >= 12 and user_norm in line_norm:
+        return True
+    return False
 
-    candidate_lines: List[str] = []
+
+def is_model_or_header_line(line: str) -> bool:
+    """يزيل عناوين البطاقات مثل Navy · Grok Uncensored دون حذف الرد نفسه."""
+    value = normalize_line(line)
+    low = value.lower()
+    target = normalize_line(TARGET_MODEL or "").lower()
+
+    if not value:
+        return True
+    if low in UI_JUNK_EXACT:
+        return True
+    if any(fragment in low for fragment in UI_JUNK_CONTAINS):
+        return True
+    if is_metric_line(value):
+        return True
+
+    # أمثلة ظاهرة في الصورة: "Navy: Grok Uncensored" أو اسم النموذج فقط.
+    if target and target in low and len(value) <= 90:
+        return True
+    if re.match(r"^(navy|model|assistant|bot|ai)\s*[:·-]", low) and len(value) <= 90:
+        return True
+    if low.startswith("grok") and len(value) <= 90:
+        return True
+
+    # أزرار أو تسميات قصيرة في الواجهة.
+    if len(value) <= 2 and not re.search(r"[\w\u0600-\u06FF]", value):
+        return True
+
+    return False
+
+
+def strip_inline_ui_fragments(line: str, user_text: str) -> str:
+    """ينظف السطر عندما يجمع الموقع عدة عناصر في سطر واحد."""
+    value = normalize_line(line)
+    if not value:
+        return ""
+
+    user_norm = normalize_line(user_text)
+    if user_norm and value == user_norm:
+        return ""
+
+    # إذا دمج العنصر فقاعة المستخدم مع الرد، احذف صدى السؤال من بداية السطر فقط.
+    if user_norm and value.lower().startswith(user_norm.lower() + " "):
+        value = value[len(user_norm) :].strip()
+
+    # احذف عنوان النموذج من بداية السطر فقط، ولا تحذف ذكر النموذج داخل الرد.
+    target = normalize_line(TARGET_MODEL or "")
+    if target:
+        target_re = re.escape(target)
+        value = re.sub(
+            rf"^(?:navy|model|assistant|bot|ai)?\s*[:·-]?\s*{target_re}\s*",
+            "",
+            value,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    value = re.sub(
+        r"\s+\d+(?:\.\d+)?\s*s\s+\d+(?:\.\d+)?\s*tok/s\s+\d+\s*tokens?\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+    value = re.sub(
+        r"\s+\d+(?:\.\d+)?\s*s.*?tok/s.*?tokens?\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).strip()
+    return value
+
+
+def response_lines_from_text(text: str, user_text: str) -> List[str]:
+    lines = []
+    for raw in str(text or "").splitlines():
+        line = strip_inline_ui_fragments(raw, user_text)
+        if not line:
+            continue
+        if is_user_echo(line, user_text):
+            continue
+        if is_model_or_header_line(line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def clean_candidate_text(text: str, user_text: str) -> str:
+    lines = response_lines_from_text(text, user_text)
+
+    compact: List[str] = []
+    for line in lines:
+        if compact and compact[-1] == line:
+            continue
+        compact.append(line)
+
+    return "\n".join(compact).strip()
+
+
+def normalize_block_for_compare(value: str) -> str:
+    return normalize_line(value).lower()
+
+
+def find_new_line_candidates(
+    current_lines: Sequence[str],
+    before_lines: Sequence[str],
+    user_text: str,
+) -> str:
+    """يستخرج الأسطر الجديدة حتى إذا كان ترتيب DOM مختلفاً عن ترتيب الشاشة."""
+    before_set = {normalize_block_for_compare(line) for line in before_lines}
+    user_norm = normalize_block_for_compare(user_text)
+
+    new_lines: List[str] = []
+    for line in current_lines:
+        key = normalize_block_for_compare(line)
+        if not key or key in before_set or key == user_norm:
+            continue
+        if is_user_echo(line, user_text) or is_model_or_header_line(line):
+            continue
+        new_lines.append(normalize_line(line))
+
+    return clean_candidate_text("\n".join(new_lines), user_text)
+
+
+def find_after_user_candidate(current_lines: Sequence[str], user_text: str) -> str:
+    """حل احتياطي: اقرأ ما بعد رسالة المستخدم إذا كان ترتيب DOM صحيحاً."""
+    filtered = [line for line in current_lines if not is_model_or_header_line(line)]
     user_index = -1
-
-    for index, line in enumerate(current):
-        line_norm = normalize_line(line)
-        if line_norm == user_norm:
-            user_index = index
-        elif len(user_norm) >= 12 and user_norm in line_norm:
+    for index, line in enumerate(filtered):
+        if is_user_echo(line, user_text):
             user_index = index
 
-    if user_index >= 0 and user_index < len(current) - 1:
-        candidate_lines = current[user_index + 1 :]
+    if user_index >= 0 and user_index < len(filtered) - 1:
+        return clean_candidate_text("\n".join(filtered[user_index + 1 :]), user_text)
+    return ""
+
+
+def block_candidate_score(candidate: str, block: str, before_blocks: Sequence[str]) -> int:
+    if not candidate:
+        return -1
+    block_key = normalize_block_for_compare(block)
+    before_keys = {normalize_block_for_compare(item) for item in before_blocks}
+    score = len(candidate)
+    if block_key not in before_keys:
+        score += 250
+    # الردود الحقيقية غالباً تحتوي مسافات/جمل، أما عناصر الواجهة تكون قصيرة جداً.
+    if " " in candidate or "\n" in candidate:
+        score += 40
+    return score
+
+
+def build_response_candidate(
+    current_snapshot: Dict[str, List[str]] | Sequence[str],
+    user_text: str,
+    before_snapshot: Optional[Dict[str, List[str]] | Sequence[str]] = None,
+) -> str:
+    """يبني أفضل رد محتمل من الصفحة.
+
+    الإصلاح الأساسي هنا أن الرد لا يُشترط أن يأتي بعد رسالة المستخدم في innerText.
+    في Gratisfy قد تظهر بطاقة الرد قبل/بعد فقاعة المستخدم داخل DOM، لذلك نبحث عن
+    النصوص الجديدة في الصفحة ونقارنها بما كان ظاهراً قبل الإرسال.
+    """
+    if isinstance(current_snapshot, dict):
+        current_lines = current_snapshot.get("bodyLines", [])
+        current_blocks = current_snapshot.get("blocks", [])
     else:
-        common = 0
-        max_common = min(len(before), len(current))
-        while common < max_common and before[common] == current[common]:
-            common += 1
-        candidate_lines = current[common:]
+        current_lines = list(current_snapshot)
+        current_blocks = []
 
-        # إذا ظهر نص المستخدم داخل الفرق، احذف كل شيء قبله ومعه.
-        for index, line in enumerate(candidate_lines):
-            line_norm = normalize_line(line)
-            if line_norm == user_norm or (len(user_norm) >= 12 and user_norm in line_norm):
-                candidate_lines = candidate_lines[index + 1 :]
+    if isinstance(before_snapshot, dict):
+        before_lines = before_snapshot.get("bodyLines", [])
+        before_blocks = before_snapshot.get("blocks", [])
+    else:
+        before_lines = list(before_snapshot or [])
+        before_blocks = []
+
+    candidates: List[tuple[int, str]] = []
+
+    # 1) أفضل مسار: العناصر/البلوكات الجديدة، لأنها غالباً تمثل فقاعة الرد نفسها.
+    for block in current_blocks:
+        candidate = clean_candidate_text(block, user_text)
+        score = block_candidate_score(candidate, block, before_blocks)
+        if score >= 0:
+            candidates.append((score, candidate))
+
+    # 2) الأسطر الجديدة في body، وهذا يحل حالة ظهور الرد قبل المستخدم في DOM.
+    new_lines_candidate = find_new_line_candidates(current_lines, before_lines, user_text)
+    if new_lines_candidate:
+        candidates.append((len(new_lines_candidate) + 220, new_lines_candidate))
+
+    # 3) حل احتياطي قديم: ما بعد رسالة المستخدم.
+    after_user_candidate = find_after_user_candidate(current_lines, user_text)
+    if after_user_candidate:
+        candidates.append((len(after_user_candidate) + 120, after_user_candidate))
+
+    if not candidates:
+        return ""
+
+    # أحياناً يكون هناك عنصر أب يحتوي الصفحة كلها، فيكون طويلاً جداً ومليئاً بالواجهة.
+    # اختر أعلى نتيجة، لكن فضّل المرشح الأقصر إذا كان يحتوي المرشح الأطول بالكامل تقريباً.
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best = candidates[0][1]
+    for _, candidate in candidates[1:8]:
+        if candidate and candidate in best and len(candidate) >= 3:
+            # إذا كان المرشح المختصر ليس مجرد كلمة قصيرة، فهو غالباً نص فقاعة الرد.
+            if len(candidate) >= 8 or " " in candidate or "\n" in candidate:
+                best = candidate
                 break
 
-    # إزالة صدى السؤال من بداية الرد إن وجد.
-    while candidate_lines:
-        first = normalize_line(candidate_lines[0])
-        if first == user_norm or (len(user_norm) >= 12 and user_norm in first):
-            candidate_lines.pop(0)
-            continue
-        break
-
-    return clean_response_text("\n".join(candidate_lines))
+    return best.strip()
 
 
 async def extract_response(
     page: Any,
     user_text: str,
-    before_lines: Optional[Sequence[str]] = None,
+    before_lines: Optional[Sequence[str] | Dict[str, List[str]]] = None,
     timeout_sec: int = 120,
 ) -> str:
-    """ينتظر حتى يستقر الرد ثم يعيده كنص نظيف."""
+    """ينتظر الرد ثم يعيده كنص.
+
+    كان التعليق يحدث لأن الكود ينتظر استقرار innerText كاملاً، بينما الموقع يغير
+    سطوراً مثل الوقت/سرعة التوكنات أو يرتب الرسائل بطريقة لا تجعل الرد بعد سؤال
+    المستخدم. الآن نرسل الرد عند استقراره مرتين، أو بعد مهلة قصيرة من ظهور أول
+    مرشح صالح حتى لا يبقى البوت معلقاً.
+    """
     start = asyncio.get_running_loop().time()
+    first_seen_at: Optional[float] = None
     last_text = ""
     stable_count = 0
 
+    # مهلة قصيرة بعد ظهور الرد: تمنع التعليق إذا بقيت الواجهة تغير أرقام التوليد.
+    return_after_first_seen = env_int("RETURN_AFTER_FIRST_SEEN", 8, minimum=2)
+    poll_interval = 1.25
+
     while (asyncio.get_running_loop().time() - start) < timeout_sec:
-        current_lines = await get_visible_lines(page)
-        current_text = build_response_candidate(current_lines, user_text, before_lines)
+        snapshot = await get_visible_text_snapshot(page)
+        current_text = build_response_candidate(snapshot, user_text, before_lines)
+        now = asyncio.get_running_loop().time()
 
         if current_text:
+            if first_seen_at is None:
+                first_seen_at = now
+                logger.info("First response candidate detected: %s", current_text[:120])
+
             if current_text == last_text:
                 stable_count += 1
-                if stable_count >= 3:
+                if stable_count >= 2:
                     return current_text
             else:
                 stable_count = 0
                 last_text = current_text
 
-        await asyncio.sleep(2)
+            if first_seen_at and (now - first_seen_at) >= return_after_first_seen:
+                logger.info("Returning response candidate after grace period")
+                return last_text.strip()
+
+        await asyncio.sleep(poll_interval)
 
     return last_text.strip()
 
@@ -695,7 +965,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         status_msg: Optional[Message] = None
         try:
             status_msg = await update.message.reply_text("⏳ جاري إرسال السؤال...")
-            before_lines = await get_visible_lines(page)
+            before_snapshot = await get_visible_text_snapshot(page)
 
             await submit_prompt(page, text)
             await edit_status(status_msg, "⏳ تم الإرسال، بانتظار الرد...")
@@ -703,7 +973,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             response = await extract_response(
                 page,
                 text,
-                before_lines=before_lines,
+                before_lines=before_snapshot,
                 timeout_sec=120,
             )
 
