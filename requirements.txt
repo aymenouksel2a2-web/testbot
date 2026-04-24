@@ -1,2 +1,2 @@
-python-telegram-bot[webhooks,job-queue,rate-limiter]==21.11.1
+python-telegram-bot[webhooks,job-queue,rate-limiter]>=20,<22
 playwright==1.44.0
