@@ -41,7 +41,7 @@ browser_ready = asyncio.Event()
 
 
 async def initialize_browser():
-    """يُستدعى مرة واحدة عند تشغيل البوت"""
+    """يفتح المتصفح ويسجل دخول ويختار النموذج مرة واحدة عند إقلاع البوت"""
     global pw, browser_ctx
 
     pw = await async_playwright().start()
@@ -97,19 +97,23 @@ async def initialize_browser():
             try:
                 await _perform_login(page)
             except Exception as e:
-                logger.warning(f"Login error: {e}")
+                logger.warning(f"Login error during init: {e}")
 
+            # العودة للصفحة الرئيسية بعد الدخول
             await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(0.8)
 
-    # اختيار النموذج
+    # اختيار النموذج (مرة واحدة فقط — يُحفظ في Persistent Context)
     if TARGET_MODEL:
-        await _select_model(page, TARGET_MODEL)
-        await asyncio.sleep(0.3)
+        try:
+            await _select_model(page, TARGET_MODEL)
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"Model selection during init: {e}")
 
     await page.close()
 
-    logger.info("✅ Browser initialized & logged in globally")
+    logger.info("✅ Global browser initialized, logged in, and model selected.")
     browser_ready.set()
 
 
@@ -301,6 +305,7 @@ async def session_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     page = None
 
     try:
+        # الانتظار حتى يُصبح المتصفح العالمي جاهزاً
         await browser_ready.wait()
 
         page = await browser_ctx.new_page()
@@ -322,18 +327,15 @@ async def session_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # اختيار النموذج (إذا لم يحتفظ الـ Context به تلقائياً للصفحات الجديدة)
-        if TARGET_MODEL:
-            await _select_model(page, TARGET_MODEL)
-            await asyncio.sleep(0.3)
+        # ⚠️ لم نُعدّ تسجيل الدخول أو اختيار النموذج هنا
+        # لأن الـ Persistent Context يحمل الجلسة والنموذج المختار مسبقاً
 
-        # تخزين الصفحة
         async with sessions_lock:
             if chat_id in sessions:
                 sessions[chat_id]["page"] = page
                 sessions[chat_id]["ready"] = True
 
-        logger.info(f"[{chat_id}] Session ready")
+        logger.info(f"[{chat_id}] Session ready (page created from global context)")
 
         # إبقاء الجلسة حية
         while True:
@@ -392,14 +394,15 @@ async def ensure_session(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     await update.message.reply_text(
         "🤖 *Gratisfy AI* — دردشة نصية سريعة\n"
         "أرسل أي رسالة للبدء.\n"
         "📌 /stop — إغلاق الجلسة",
         parse_mode="Markdown",
     )
-    # تشغيل الجلسة في الخلفية مباشرة
-    asyncio.create_task(ensure_session(update.effective_chat.id, context))
+    # ✅ نبدأ الجلسة في الخلفية مباشرةً لكي تكون جاهزة للرسالة التالية
+    asyncio.create_task(ensure_session(chat_id, context))
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
