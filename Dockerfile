@@ -4,15 +4,15 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium
 
 COPY . .
 
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
+ENV PERSISTENT_DIR=/tmp/gratisfy-data
 
-# إنشاء مجلد البيانات المستمر مع صلاحيات للمستخدم pwuser
-RUN mkdir -p /tmp/gratisfy-data && chown -R pwuser:pwuser /tmp/gratisfy-data
+# إنشاء مجلد بيانات للجلسة مع صلاحيات المستخدم غير الجذري
+RUN mkdir -p /tmp/gratisfy-data && chown -R pwuser:pwuser /tmp/gratisfy-data /app
 
 USER pwuser
 
