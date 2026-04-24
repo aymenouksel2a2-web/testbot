@@ -34,7 +34,7 @@ PERSISTENT_DIR = "/tmp/gratisfy-data"
 sessions: Dict[int, Dict[str, Any]] = {}
 sessions_lock: Optional[asyncio.Lock] = None
 
-# ── Global browser context (initialized once on startup) ──
+# ── Global browser (initialized once on startup) ──
 pw: Optional[Any] = None
 browser_ctx: Optional[BrowserContext] = None
 browser_ready = asyncio.Event()
@@ -81,7 +81,7 @@ async def initialize_browser():
         except Exception:
             pass
 
-    # تسجيل دخول ذكي
+    # تسجيل دخول ذكي (مرة واحدة فقط بفضل persistent context)
     if LOGIN_EMAIL and LOGIN_PASSWORD:
         needs_login = False
         for sel in ['button:has-text("Log in")', 'a:has-text("Log in")', '[data-testid="login-button"]']:
@@ -99,8 +99,8 @@ async def initialize_browser():
             except Exception as e:
                 logger.warning(f"Login error: {e}")
 
-        await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(0.8)
+            await page.goto(URL, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(0.8)
 
     # اختيار النموذج
     if TARGET_MODEL:
@@ -322,7 +322,7 @@ async def session_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-        # اختيار النموذج على الصفحة الجديدة (إذا لزم)
+        # اختيار النموذج (إذا لم يحتفظ الـ Context به تلقائياً للصفحات الجديدة)
         if TARGET_MODEL:
             await _select_model(page, TARGET_MODEL)
             await asyncio.sleep(0.3)
