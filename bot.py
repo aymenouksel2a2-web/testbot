@@ -256,59 +256,55 @@ async def select_model(page, model_name: str) -> bool:
 
 
 async def extract_response(page, user_text: str, timeout_sec: int = 120) -> str:
-    """يستخرج رد البوت بنفس منطق النسخة التي كانت تعمل، مع إصلاح خطأ page.evaluate."""
+    """يستخرج رد البوت باستخدام innerText مع فلترة UI قوية"""
     start = asyncio.get_event_loop().time()
     last_text = ""
     stable = 0
 
     while (asyncio.get_event_loop().time() - start) < timeout_sec:
         js_result = await page.evaluate(
-            """(userText) => {
-                const u = String(userText || '').trim();
-                const NL = String.fromCharCode(10);
+            """(u) => {
                 const raw = document.body.innerText || '';
-                const lines = raw.split(NL).map(l => l.trim()).filter(Boolean);
-
+                const lines = raw.split('\\n').map(l => l.trim()).filter(Boolean);
+                
                 const junk = [
                     'Enter to send','Shift + Enter','Ctrl/Cmd + V','paste attachment',
                     'attach file','record','Message Grok','Start a conversation',
                     'Select a model','Settings','Gratisfy','to send','for new line',
                     'Send message','Attach','Paperclip','Mic','new line',
                     'tokens','tok/s','Thinking','Stop generating','Regenerate',
-                    'Copy','Like','Dislike','Share','Export','Web search','Reason',
-                    'Enter','Join the Gratisfy Discord','JOIN DISCORD','NOT NOW','COMMUNITY'
+                    'Copy','Like','Dislike','Share','Export','Web search','Reason'
                 ];
-
+                
                 const clean = lines.filter(l => {
                     const low = l.toLowerCase();
-                    return l.length > 2
-                        && l !== u
+                    return l.length > 2 
+                        && l !== u 
                         && !junk.some(j => low.includes(j.toLowerCase()))
-                        && !/^[0-9]+[.]?[0-9]*[ ]*s$/.test(l)
-                        && !/^[0-9]+[.]?[0-9]*[ ]*tok[/]s$/.test(l)
-                        && !/^[0-9]+([.][0-9]+)?[ ]*k?[ ]*tokens?$/i.test(l);
+                        && !/^\\d+\\.?\\d*\\s*s?$/.test(l)
+                        && !/^\\d+\\.?\\d*\\s*tok\\/s?$/.test(l)
+                        && !/^\\d+\\s*tokens?$/.test(l);
                 });
-
-                // أجد مؤشر رسالة المستخدم، ثم آخذ ما بعدها كإجابة
+                
+                // أجد مؤشر رسالة المستخدم
                 let idx = -1;
-                for (let i = clean.length - 1; i >= 0; i--) {
-                    if (u && (clean[i] === u || clean[i].includes(u) || u.includes(clean[i]))) {
+                for(let i=0; i<clean.length; i++){
+                    if(clean[i]===u || clean[i].includes(u) || u.includes(clean[i])){
                         idx = i;
                         break;
                     }
                 }
-
-                if (idx >= 0 && idx < clean.length - 1) {
-                    return clean.slice(idx + 1).join(NL);
+                
+                if(idx >= 0 && idx < clean.length - 1){
+                    return clean.slice(idx + 1).join('\\n');
                 }
-
-                // fallback: آخر نص واضح في الصفحة
-                const long = clean.filter(l => l.length > 8);
-                if (long.length) return long[long.length - 1];
-
+                
+                const long = clean.filter(l => l.length > 15);
+                if(long.length) return long.sort((a,b) => b.length - a.length)[0];
+                
                 return clean.length ? clean[clean.length - 1] : '';
             }""",
-            user_text,
+            [user_text],
         )
 
         current = (js_result or "").strip()
