@@ -3,7 +3,7 @@ import asyncio
 import logging
 import io
 import re
-import html
+import html as html_module
 from typing import Any, Dict, List, Optional
 
 from telegram import Update, InputMediaPhoto
@@ -38,7 +38,7 @@ TARGET_MODEL = os.environ.get("TARGET_MODEL", "Grok Uncensored")
 
 STREAM_INTERVAL = 3
 PERSISTENT_DIR = "/tmp/gratisfy-data"
-MAX_MSG_LEN = 4000  # حد تليجرام الافتراضي
+MAX_MSG_LEN = 4000  # حد تليجرام
 
 # ═══════════════════════════════════════════════════════════════
 #  بنية البيانات
@@ -55,225 +55,187 @@ async def post_init(app: Application) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  تنظيف + تنسيق الردود
+#  Markdown → Telegram HTML
 # ═══════════════════════════════════════════════════════════════
 
-def clean_text(text: str) -> str:
-    """تنظيف UI lines مع الحفاظ على leading whitespace للكود"""
-    if not text:
-        return ""
+def md_to_tg_html(md: str) -> str:
+    """يحوّل Markdown بسيط (fenced code + bold + italic + inline code) إلى Telegram HTML"""
+    pattern = re.compile(r'```([^\n]*)\n(.*?)\n?```', re.DOTALL)
 
-    ui_line_patterns = [
-        r'Enter(\s+to\s+send)?',
-        r'Shift\s*\+\s*Enter',
-        r'Ctrl[/\\]?Cmd\s*\+\s*V',
-        r'paste\s*attachment(\s*[·•])?',
-        r'attach\s*file?(\s*[·•])?',
-        r'to\s+send(\s*[·•])?',
-        r'for\s+new\s+line(\s*[·•])?',
-        r'record(\s*[·•])?',
-        r'Message\s*Grok',
-        r'Start\s+a\s+conversation',
-        r'Select\s+a\s+model',
-        r'Settings?',
-        r'^Gratisfy$',
-        r'Send\s*message',
-        r'Attach',
-        r'Paper\s*clip',
-        r'Mic(rophone)?',
-        r'new\s*line',
-        r'\d+\.?\d*\s*s(ec)?',
-        r'\d+\.?\d*\s*tok[/\\]s?',
-        r'\d+\s*tokens?',
-        r'Thinking',
-        r'Stop\s*generating',
-        r'Regenerate',
-        r'Copy',
-        r'Like',
-        r'Dislike',
-        r'Share',
-        r'Export',
-        r'Web\s*search',
-        r'Reason',
-    ]
+    result_parts: List[str] = []
+    last_idx = 0
 
-    lines = text.splitlines()
-    cleaned_lines: List[str] = []
+    for match in pattern.finditer(md):
+        start, end = match.span()
+        lang = match.group(1).strip()
+        code = match.group(2)
 
-    for raw in lines:
-        # ❌ لا نستخدم .strip() العمياء!
-        # نحتفظ بالـ leading spaces (indentation) ونزيل trailing فقط
-        line = raw.rstrip()
+        # النص العادي قبل الكود
+        if start > last_idx:
+            result_parts.append(_md_text_to_html(md[last_idx:start]))
 
-        stripped_for_check = line.strip()
-        if not stripped_for_check:
-            # نحتفظ بالأسطر الفارغة داخل الـ text لكنها ستُراجع لاحقاً
-            cleaned_lines.append(line)
-            continue
-
-        is_junk = False
-        for pat in ui_line_patterns:
-            if re.fullmatch(rf'\s*{pat}\s*', stripped_for_check, re.IGNORECASE):
-                is_junk = True
-                break
-
-        if is_junk:
-            continue
-
-        cleaned_lines.append(line)
-
-    return "\n".join(cleaned_lines)
-
-
-def _looks_like_code_line(line: str) -> bool:
-    """يحدد ما إذا كان السطر جزءاً من كود برمجي"""
-    if not line:
-        return False
-
-    leading = len(line) - len(line.lstrip())
-    s = line.lstrip()
-
-    # indentation واضح (tab أو 4+ مسافات أو 2+ مع رموز برمجية)
-    if line.startswith('\t'):
-        return True
-    if leading >= 4:
-        return True
-    if leading >= 2 and any(ch in s for ch in '=[{()}:;.,|&+-*/%<>!'):
-        return True
-
-    # كلمات / أنماط مفتاحية
-    code_signatures = [
-        r'^import\s', r'^from\s+\S+\s+import', r'^def\s', r'^class\s',
-        r'^return\b', r'^if\b', r'^elif\b', r'^else\b', r'^for\b',
-        r'^while\b', r'^with\b', r'^try\b', r'^except\b', r'^finally\b',
-        r'^print\s*\(', r'^console\.', r'^const\b', r'^let\b', r'^var\b',
-        r'^function\b', r'^#\s', r'^//\s', r'^/\*', r'^\*/',
-        r'^echo\b', r'^<\?php', r'^<\?', r'^<html', r'^<div', r'^<span', r'^<script',
-        r'^npm\s', r'^yarn\s', r'^pip\s', r'^git\s', r'^curl\s',
-        r'^python\s', r'^node\s', r'^bash\s', r'^```',
-    ]
-
-    for sig in code_signatures:
-        if re.search(sig, s, re.IGNORECASE):
-            return True
-
-    return False
-
-
-def format_as_telegram_html(text: str) -> str:
-    """يحول النص إلى HTML مع تغليف الكود تلقائياً في <pre><code>"""
-    lines = text.splitlines()
-    out_segments: List[tuple[str, str]] = []  # (type, content)
-
-    i = 0
-    n = len(lines)
-
-    while i < n:
-        line = lines[i]
-
-        if _looks_like_code_line(line):
-            code_lines: List[str] = [line]
-            i += 1
-            while i < n:
-                nxt = lines[i]
-                if _looks_like_code_line(nxt):
-                    code_lines.append(nxt)
-                    i += 1
-                elif nxt.strip() == '':
-                    # سطر فارغ داخل الكود: استمر إذا كان السطر اللاحق كود أو فارغ أيضاً
-                    if i + 1 < n and (_looks_like_code_line(lines[i + 1]) or lines[i + 1].strip() == ''):
-                        code_lines.append(nxt)
-                        i += 1
-                    else:
-                        break
-                else:
-                    break
-
-            # إزالة الأسطر الفارغة من أطراف الكتلة فقط
-            while code_lines and code_lines[0].strip() == '':
-                code_lines.pop(0)
-            while code_lines and code_lines[-1].strip() == '':
-                code_lines.pop()
-
-            if code_lines:
-                body = html.escape('\n'.join(code_lines))
-                out_segments.append(('code', f'<pre><code>{body}</code></pre>'))
+        # الكود: نحافظ على كل شيء داخل <pre>
+        escaped_code = html_module.escape(code)
+        if lang:
+            result_parts.append(
+                f'<pre><code class="language-{html_module.escape(lang)}">{escaped_code}</code></pre>'
+            )
         else:
-            if line.strip() == '':
-                out_segments.append(('text', ''))
-            else:
-                out_segments.append(('text', html.escape(line)))
-            i += 1
+            result_parts.append(f'<pre><code>{escaped_code}</code></pre>')
 
-    # دمج النص العادي المتتالي بـ <br>
-    final_parts: List[str] = []
-    text_buffer: List[str] = []
+        last_idx = end
 
-    for seg_type, seg_content in out_segments:
-        if seg_type == 'code':
-            if text_buffer:
-                final_parts.append('<br>\n'.join(text_buffer))
-                text_buffer = []
-            final_parts.append(seg_content)
-        else:
-            text_buffer.append(seg_content)
+    # النص الباقي
+    if last_idx < len(md):
+        result_parts.append(_md_text_to_html(md[last_idx:]))
 
-    if text_buffer:
-        final_parts.append('<br>\n'.join(text_buffer))
-
-    return '\n\n'.join(final_parts)
+    return '\n\n'.join(result_parts)
 
 
-async def deliver_response(update: Update, text: str):
-    """تنسيق الرد وإرساله للمستخدم (HTML قصير أو ملف طويل)"""
-    # 1. تنظيف نهائي قوي
-    cleaned = clean_text(text)
-    cleaned = re.sub(r'\n?\d+\.?\d*\s*s(?:ec)?\s*\n?', '\n', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\n?\d+\.?\d*\s*tok[/\\]?s?\s*\n?', '\n', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\n?\d+\s*tokens?\s*\n?', '\n', cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.strip('\n')
+def _md_text_to_html(text: str) -> str:
+    """يحول نص Markdown عادي (بدون fenced blocks) إلى HTML"""
+    # inline code أولاً
+    parts: List[str] = []
+    pos = 0
+    for m in re.finditer(r'`([^`]+)`', text):
+        if m.start() > pos:
+            parts.append(_md_inline_to_html(text[pos:m.start()]))
+        parts.append(f'<code>{html_module.escape(m.group(1))}</code>')
+        pos = m.end()
+    if pos < len(text):
+        parts.append(_md_inline_to_html(text[pos:]))
+    return ''.join(parts)
 
-    if not cleaned:
+
+def _md_inline_to_html(text: str) -> str:
+    """يحول bold/italic/escape في نص عادي"""
+    placeholders: List[str] = []
+
+    def placeholder_repl(m, tag: str):
+        inner = html_module.escape(m.group(1))
+        token = f'\x00{len(placeholders)}\x00'
+        placeholders.append(f'<{tag}>{inner}</{tag}>')
+        return token
+
+    text = re.sub(r'\*\*(.+?)\*\*', lambda m: placeholder_repl(m, 'b'), text)
+    text = re.sub(r'__(.+?)__', lambda m: placeholder_repl(m, 'i'), text)
+    text = re.sub(r'~~(.+?)~~', lambda m: placeholder_repl(m, 's'), text)
+
+    text = html_module.escape(text)
+    text = text.replace('\n', '<br>')
+
+    for idx, val in enumerate(placeholders):
+        text = text.replace(f'\x00{idx}\x00', val)
+
+    return text
+
+
+async def deliver_response(update: Update, md_text: str):
+    """يُنسّق الرد ويُرسله للمستخدم (HTML)"""
+    if not md_text or not md_text.strip():
         await update.message.reply_text("⚠️ لم أتمكن من استخراج رد نصي من الموقع.")
         return
 
-    html_body = format_as_telegram_html(cleaned)
+    md_text = md_text.rstrip()
+    html_body = md_to_tg_html(md_text)
 
-    # إذا كان أقل من الحد، أرسله دفعة واحدة
     if len(html_body) <= MAX_MSG_LEN:
         await update.message.reply_text(html_body, parse_mode="HTML")
         return
 
-    # تقسيم بذكاء عند الفقرات
-    blocks = cleaned.split('\n\n')
-    current_html = ""
+    # تقسيم بذكاء عند الفقرات في Markdown (أمان أكبر)
+    blocks = md_text.split('\n\n')
+    current_md = ""
 
     for block in blocks:
         if not block.strip():
             continue
-
-        block_html = format_as_telegram_html(block)
-        if len(current_html) + len(block_html) + 2 <= MAX_MSG_LEN:
-            current_html += block_html + '\n\n'
+        if len(current_md) + len(block) + 2 <= (MAX_MSG_LEN - 300):
+            current_md += block + '\n\n'
         else:
-            if current_html.strip():
-                await update.message.reply_text(current_html.strip(), parse_mode="HTML")
+            if current_md.strip():
+                part_html = md_to_tg_html(current_md.strip())
+                await update.message.reply_text(part_html, parse_mode="HTML")
                 await asyncio.sleep(0.3)
+            current_md = block + '\n\n'
 
-            # إذا كان block وحده ضخماً، أرسل كملف نصي ليحافظ على التنسيق
-            if len(block_html) > MAX_MSG_LEN:
-                buf = io.BytesIO(block.encode('utf-8'))
-                buf.name = "response.txt"
-                await update.message.reply_document(
-                    document=buf,
-                    caption="📄 الكتلة طويلة جداً — أرسلتها كملف نصي."
-                )
-                current_html = ""
-            else:
-                current_html = block_html + '\n\n'
+    if current_md.strip():
+        part_html = md_to_tg_html(current_md.strip())
+        await update.message.reply_text(part_html, parse_mode="HTML")
 
-    if current_html.strip():
-        await update.message.reply_text(current_html.strip(), parse_mode="HTML")
+
+# ═══════════════════════════════════════════════════════════════
+#  Fetch Interceptor (يُحقّن في المتصفح)
+# ═══════════════════════════════════════════════════════════════
+
+INTERCEPTOR_JS = """() => {
+    if (window.__fetchIntercepted) return;
+    window.__fetchIntercepted = true;
+    window.__lastBotResponse = '';
+    window.__lastBotDone = false;
+
+    const _origFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const response = await _origFetch.apply(this, args);
+        if (!response.url || !response.url.includes('/api/chat')) {
+            return response;
+        }
+
+        // بداية محادثة جديدة: نصفّر
+        window.__lastBotResponse = '';
+        window.__lastBotDone = false;
+
+        const [streamPage, streamCapture] = response.body.tee();
+        const newResponse = new Response(streamPage, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+        });
+
+        const reader = streamCapture.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        (async () => {
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\\n');
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = line.slice(6);
+
+                        if (data === '[DONE]') {
+                            window.__lastBotDone = true;
+                            continue;
+                        }
+
+                        try {
+                            const obj = JSON.parse(data);
+                            if (obj.choices && obj.choices[0] && obj.choices[0].delta) {
+                                const content = obj.choices[0].delta.content;
+                                if (typeof content === 'string') {
+                                    window.__lastBotResponse += content;
+                                }
+                                const finish = obj.choices[0].finish_reason;
+                                if (finish === 'stop') {
+                                    window.__lastBotDone = true;
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {}
+        })();
+
+        return newResponse;
+    };
+}"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -479,51 +441,33 @@ async def select_model(page, model_name: str) -> bool:
     return True
 
 
-async def extract_response(
-    page: Any,
-    user_text: str,
-    pre_text: Optional[str] = None,
-    timeout_sec: int = 120,
-) -> str:
-    """يستخرج رد البوت باستخدام الفرق بين innerText قبل وبعد الإرسال"""
+async def extract_response(page: Any, timeout_sec: int = 120) -> str:
+    """يستخرج رد البوت من الـ fetch interceptor المُثبَّت في الصفحة"""
     start = asyncio.get_event_loop().time()
     last_text = ""
     stable = 0
 
     while (asyncio.get_event_loop().time() - start) < timeout_sec:
-        js_result = await page.evaluate(
-            """({ user, pre }) => {
-                const raw = document.body.innerText || '';
-                let candidate = '';
+        result = await page.evaluate("""() => {
+            return {
+                text: window.__lastBotResponse || '',
+                done: window.__lastBotDone || false
+            };
+        }""")
 
-                if (pre && raw.length > pre.length && raw.startsWith(pre)) {
-                    candidate = raw.substring(pre.length);
-                } else {
-                    const idx = raw.lastIndexOf(user);
-                    if (idx !== -1) {
-                        candidate = raw.substring(idx + user.length);
-                    }
-                }
+        current = result.get("text", "")
+        done = result.get("done", False)
 
-                if (candidate.startsWith(user)) {
-                    candidate = candidate.substring(user.length);
-                }
+        current_cmp = current.rstrip()
 
-                return candidate;
-            }""",
-            {"user": user_text, "pre": pre_text or ""},
-        )
-
-        current = (js_result or "").strip()
-
-        if current:
-            if current == last_text:
+        if current_cmp:
+            if current_cmp == last_text:
                 stable += 1
-                if stable >= 2:
-                    return current
+                if done or stable >= 3:
+                    return current_cmp
             else:
                 stable = 0
-                last_text = current
+                last_text = current_cmp
 
         await asyncio.sleep(1.5)
 
@@ -611,9 +555,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             status_msg = await update.message.reply_text("⏳ جاري إرسال السؤال...")
 
-            # ── التقاط حالة الصفحة قبل الإرسال ──
-            pre_inner = await page.evaluate("() => document.body.innerText || ''")
-
             # ── إيجاد حقل الإدخال ──
             textarea = None
             for sel in [
@@ -639,10 +580,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد...")
 
-            # ── استخراج الرد ──
-            response = await extract_response(
-                page, text, pre_text=pre_inner, timeout_sec=120
-            )
+            # ── استخراج الرد من interceptor ──
+            response_md = await extract_response(page, timeout_sec=120)
 
             try:
                 await status_msg.delete()
@@ -650,7 +589,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
             # ── تنسيق وإرسال الرد للمستخدم ──
-            await deliver_response(update, response)
+            await deliver_response(update, response_md)
 
         except Exception as e:
             logger.exception("[handle_message] Error")
@@ -675,7 +614,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
         pw = await async_playwright().start()
 
-        # ━━ متصفح مستمر (يحفظ الجلسة إلى الأبد) ━━
         browser_ctx = await pw.chromium.launch_persistent_context(
             PERSISTENT_DIR,
             headless=True,
@@ -705,6 +643,9 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         await snap(page, context, chat_id, "🌐 تم الوصول إلى الموقع")
         await asyncio.sleep(1.5)
+
+        # ── تثبيت interceptor في الصفحة ──
+        await page.evaluate(INTERCEPTOR_JS)
 
         # إغلاق Popups
         for sel in ["button:has-text('Close')", "[aria-label='Close']", "button.close"]:
@@ -739,6 +680,8 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             # تحقق نهائي في /chat
             await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2)
+            # أعد تثبيت interceptor بعد إعادة التحميل
+            await page.evaluate(INTERCEPTOR_JS)
 
         # ━━ اختيار النموذج ━━
         if TARGET_MODEL:
