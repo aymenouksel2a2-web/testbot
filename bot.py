@@ -3,7 +3,7 @@ import asyncio
 import logging
 import io
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from telegram import Update, InputMediaPhoto
 from telegram.ext import (
@@ -37,6 +37,7 @@ TARGET_MODEL = os.environ.get("TARGET_MODEL", "Grok Uncensored")
 
 STREAM_INTERVAL = 3
 PERSISTENT_DIR = "/tmp/gratisfy-data"
+MAX_MSG_LEN = 4000  # حد تليجرام الافتراضي
 
 # ═══════════════════════════════════════════════════════════════
 #  بنية البيانات
@@ -65,7 +66,7 @@ async def snap(
 ):
     """يلتقط لقطة شاشة ويُحدّث الرسالة المصوّرة في نفس الرسالة"""
     try:
-        screenshot = await page.screenshot(type="jpeg", quality=60)
+        screenshot = await page.screenshot(type="jpeg", quality=55)
         photo = io.BytesIO(screenshot)
         photo.name = "stream.jpg"
 
@@ -85,6 +86,7 @@ async def snap(
                 if chat_id in streams:
                     streams[chat_id]["message_id"] = sent.message_id
         else:
+            # نتجنب إرسال نفس الوسائط إذا لم تتغير كثيراً (يقلل من BadRequest)
             edit = io.BytesIO(screenshot)
             await context.bot.edit_message_media(
                 chat_id=chat_id,
@@ -96,6 +98,103 @@ async def snap(
             logger.warning(f"[snap] BadRequest: {e}")
     except Exception as e:
         logger.warning(f"[snap] Error: {e}")
+
+
+def clean_text(text: str) -> str:
+    """
+    تنظيف نهائي قوي لبقايا UI:
+    يزيل أسطر الأزرار والاختصارات والإحصائيات السفلية.
+    """
+    if not text:
+        return ""
+
+    # أنماط تطابق السطر بالكامل (مع مساحات بيضاء اختيارية)
+    ui_line_patterns = [
+        r'Enter\s*(to\s*send)?',
+        r'Shift\s*\+\s*Enter',
+        r'Ctrl[/\\]Cmd\s*\+\s*V',
+        r'paste\s*attachment',
+        r'attach\s*file?',
+        r'record',
+        r'Message\s*Grok',
+        r'Start\s*a\s*conversation',
+        r'Select\s*a\s*model',
+        r'Settings?',
+        r'Gratisfy',           # فقط إذا كان السطر منفرداً
+        r'Send\s*message',
+        r'Attach',
+        r'Paper\s*clip',
+        r'Mic(rophone)?',
+        r'new\s*line',
+        r'\d+\.?\d*\s*s(ec)?',        # 2.7s
+        r'\d+\.?\d*\s*tok[/\\]s?',
+        r'\d+\s*tokens?',
+        r'Thinking',
+        r'Stop\s*generating',
+        r'Regenerate',
+        r'Copy',
+        r'Like',
+        r'Dislike',
+        r'Share',
+        r'Export',
+        r'Web\s*search',
+        r'Reason',
+    ]
+
+    lines = text.splitlines()
+    cleaned: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # إذا كان السطر يطابق نمط UI بالكامل، نتجاهله
+        is_junk = False
+        for pat in ui_line_patterns:
+            if re.fullmatch(rf'\s*{pat}\s*', stripped, re.IGNORECASE):
+                is_junk = True
+                break
+
+        if is_junk:
+            continue
+
+        # تجاهل الأسطر القصيرة جداً التي لا تحتوي على حروف (مثل "•" أو "⎘")
+        if len(stripped) < 3 and not any(c.isalpha() for c in stripped):
+            continue
+
+        cleaned.append(stripped)
+
+    return "\n".join(cleaned)
+
+
+async def send_long_text(update: Update, text: str):
+    """يقسّم النص الطويل بذكاء عند الفقرات/الأسطر دون كسر الجمل"""
+    if len(text) <= MAX_MSG_LEN:
+        await update.message.reply_text(text)
+        return
+
+    remaining = text
+    while remaining:
+        if len(remaining) <= MAX_MSG_LEN:
+            await update.message.reply_text(remaining)
+            break
+
+        # نبحث عن أفضل نقطة قص ضمن الحد
+        cut = remaining.rfind('\n\n', 0, MAX_MSG_LEN)
+        if cut == -1:
+            cut = remaining.rfind('\n', 0, MAX_MSG_LEN)
+        if cut == -1:
+            cut = remaining.rfind('. ', 0, MAX_MSG_LEN)
+        if cut <= 0:
+            cut = MAX_MSG_LEN
+
+        part = remaining[:cut].strip()
+        if part:
+            await update.message.reply_text(part)
+            await asyncio.sleep(0.4)  # راحة بسيطة لتجنب rate-limit
+
+        remaining = remaining[cut:].strip()
 
 
 async def is_login_visible(page) -> bool:
@@ -255,71 +354,63 @@ async def select_model(page, model_name: str) -> bool:
     return True
 
 
-async def extract_response(page, user_text: str, timeout_sec: int = 120) -> str:
-    """يستخرج رد البوت باستخدام innerText مع فلترة UI قوية"""
+async def extract_response(
+    page: Any,
+    user_text: str,
+    pre_text: Optional[str] = None,
+    timeout_sec: int = 120,
+) -> str:
+    """
+    يستخرج رد البوت باستخدام الفرق بين innerText قبل وبعد الإرسال،
+    مع fallback على innerText العام إذا لم يكن pre_text متاحاً.
+    """
     start = asyncio.get_event_loop().time()
     last_text = ""
     stable = 0
 
     while (asyncio.get_event_loop().time() - start) < timeout_sec:
         js_result = await page.evaluate(
-            """(u) => {
+            """({ user, pre }) => {
                 const raw = document.body.innerText || '';
-                const lines = raw.split('\\n').map(l => l.trim()).filter(Boolean);
-                
-                const junk = [
-                    'Enter to send','Shift + Enter','Ctrl/Cmd + V','paste attachment',
-                    'attach file','record','Message Grok','Start a conversation',
-                    'Select a model','Settings','Gratisfy','to send','for new line',
-                    'Send message','Attach','Paperclip','Mic','new line',
-                    'tokens','tok/s','Thinking','Stop generating','Regenerate',
-                    'Copy','Like','Dislike','Share','Export','Web search','Reason'
-                ];
-                
-                const clean = lines.filter(l => {
-                    const low = l.toLowerCase();
-                    return l.length > 2 
-                        && l !== u 
-                        && !junk.some(j => low.includes(j.toLowerCase()))
-                        && !/^\\d+\\.?\\d*\\s*s?$/.test(l)
-                        && !/^\\d+\\.?\\d*\\s*tok\\/s?$/.test(l)
-                        && !/^\\d+\\s*tokens?$/.test(l);
-                });
-                
-                // أجد مؤشر رسالة المستخدم
-                let idx = -1;
-                for(let i=0; i<clean.length; i++){
-                    if(clean[i]===u || clean[i].includes(u) || u.includes(clean[i])){
-                        idx = i;
-                        break;
+                let candidate = '';
+
+                if (pre && raw.length > pre.length && raw.startsWith(pre)) {
+                    // الاستراتيجية المثالية: أخذ الفرق فقط
+                    candidate = raw.substring(pre.length);
+                } else {
+                    // Fallback: أخذ كل شيء بعد آخر ظهور لنص المستخدم
+                    const idx = raw.lastIndexOf(user);
+                    if (idx !== -1) {
+                        candidate = raw.substring(idx + user.length);
                     }
                 }
-                
-                if(idx >= 0 && idx < clean.length - 1){
-                    return clean.slice(idx + 1).join('\\n');
+
+                // إزالة نص المستخدم نفسه إذا تبقى في بداية الفرق
+                if (candidate.startsWith(user)) {
+                    candidate = candidate.substring(user.length);
                 }
-                
-                const long = clean.filter(l => l.length > 15);
-                if(long.length) return long.sort((a,b) => b.length - a.length)[0];
-                
-                return clean.length ? clean[clean.length - 1] : '';
+
+                return candidate;
             }""",
-            [user_text],
+            {"user": user_text, "pre": pre_text or ""},
         )
 
         current = (js_result or "").strip()
+        current = clean_text(current)
+
         if current:
             if current == last_text:
                 stable += 1
-                if stable >= 3:  # استقرار لـ 6 ثوانٍ تقريباً
+                # استقرار لـ ~3 ثوانٍ (sleep 1.5 × 2)
+                if stable >= 2:
                     return current
             else:
                 stable = 0
                 last_text = current
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1.5)
 
-    return last_text
+    return clean_text(last_text)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -403,7 +494,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             status_msg = await update.message.reply_text("⏳ جاري إرسال السؤال...")
 
-            # إيجاد textarea
+            # ── التقاط حالة الصفحة قبل الإرسال ──
+            pre_inner = await page.evaluate("() => document.body.innerText || ''")
+
+            # ── إيجاد حقل الإدخال ──
             textarea = None
             for sel in [
                 'textarea[placeholder*="Message" i]',
@@ -428,8 +522,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد...")
 
-            # ── استخراج الرد ──
-            response = await extract_response(page, text, timeout_sec=120)
+            # ── استخراج الرد باستخدام الفرق (أدق بكثير) ──
+            response = await extract_response(
+                page, text, pre_text=pre_inner, timeout_sec=120
+            )
 
             try:
                 await status_msg.delete()
@@ -442,20 +538,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-            # تنظيف نهائي
-            cleaned = re.sub(r"\n?\d+\.?\d*\s*s?\s*\n?", "\n", response)
-            cleaned = re.sub(r"\n?\d+\.?\d*\s*tok/s?\s*\n?", "\n", cleaned)
-            cleaned = re.sub(r"\n?\d+\s*tokens?\s*\n?", "\n", cleaned)
-            cleaned = cleaned.strip()
-
-            # إرسال للمستخدم
-            max_len = 4000
-            if len(cleaned) <= max_len:
-                await update.message.reply_text(cleaned)
-            else:
-                parts = [cleaned[i : i + max_len] for i in range(0, len(cleaned), max_len)]
-                for part in parts:
-                    await update.message.reply_text(part)
+            # ── إرسال النظيف للمستخدم ──
+            await send_long_text(update, response)
 
         except Exception as e:
             logger.exception("[handle_message] Error")
@@ -533,7 +617,9 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 except Exception as e:
                     logger.warning(f"Login error: {e}")
                     await snap(
-                        page, context, chat_id,
+                        page,
+                        context,
+                        chat_id,
                         f"⚠️ خطأ في الدخول: {str(e)[:100]}",
                     )
             else:
@@ -546,7 +632,9 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         # ━━ اختيار النموذج ━━
         if TARGET_MODEL:
             await snap(
-                page, context, chat_id,
+                page,
+                context,
+                chat_id,
                 f"🔽 اختيار النموذج: {TARGET_MODEL}...",
             )
             ok = await select_model(page, TARGET_MODEL)
@@ -562,7 +650,9 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
                 streams[chat_id]["ready"] = True
 
         await snap(
-            page, context, chat_id,
+            page,
+            context,
+            chat_id,
             "✅ جاهز! أرسل أي رسالة الآن.\nأرسل /stop لإيقاف البث.",
         )
 
