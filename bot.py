@@ -4,6 +4,7 @@ import logging
 import io
 import re
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from telegram import Update, InputMediaPhoto
@@ -59,7 +60,12 @@ async def post_init(app: Application) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def _html_esc(s: str) -> str:
-    return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def _escape_md_inline(text: str) -> str:
@@ -72,30 +78,30 @@ def _escape_md_inline(text: str) -> str:
         placeholders.append(f"<{tag_name}>{inner}</{tag_name}>")
         return token
 
-    text = re.sub(r'\*\*(.+?)\*\*', lambda m: store_tag(m, 'b'), text)
-    text = re.sub(r'__(.+?)__', lambda m: store_tag(m, 'i'), text)
-    text = re.sub(r'~~(.+?)~~', lambda m: store_tag(m, 's'), text)
+    text = re.sub(r"\*\*(.+?)\*\*", lambda m: store_tag(m, "b"), text)
+    text = re.sub(r"__(.+?)__", lambda m: store_tag(m, "i"), text)
+    text = re.sub(r"~~(.+?)~~", lambda m: store_tag(m, "s"), text)
 
     # inline code
     parts = []
     pos = 0
-    for m in re.finditer(r'`([^`]+)`', text):
+    for m in re.finditer(r"`([^`]+)`", text):
         if m.start() > pos:
-            parts.append(_escape_md_plain(text[pos:m.start()]))
-        parts.append(f'<code>{_html_esc(m.group(1))}</code>')
+            parts.append(_escape_md_plain(text[pos : m.start()]))
+        parts.append(f"<code>{_html_esc(m.group(1))}</code>")
         pos = m.end()
     if pos < len(text):
         parts.append(_escape_md_plain(text[pos:]))
     else:
-        parts.append('')
+        parts.append("")
 
-    return ''.join(parts)
+    return "".join(parts)
 
 
 def _escape_md_plain(text: str) -> str:
-    """يهرب HTML ويحول \n إلى <br>"""
+    """يهرب HTML ويحول \\n إلى <br>"""
     text = _html_esc(text)
-    text = text.replace('\n', '<br>')
+    text = text.replace("\n", "<br>")
     return text
 
 
@@ -105,22 +111,21 @@ def md_to_tg_html(md: str) -> str:
     last_idx = 0
 
     # fenced code blocks: ```lang\ncode\n```
-    for m in re.finditer(r'```([^\n]*)\n(.*?)\n?```', md, re.DOTALL):
+    for m in re.finditer(r"```([^\n]*)\n(.*?)\n?```", md, re.DOTALL):
         start, end = m.span()
         if start > last_idx:
             result_parts.append(_escape_md_inline(md[last_idx:start]))
 
-        lang = m.group(1).strip()
         code = m.group(2)
         code_escaped = _html_esc(code)
-        # Telegram <pre> alone makes monospace block; optional lang class
-        result_parts.append(f'<pre><code>{code_escaped}</code></pre>')
+        # Telegram <pre> alone makes monospace block
+        result_parts.append(f"<pre><code>{code_escaped}</code></pre>")
         last_idx = end
 
     if last_idx < len(md):
         result_parts.append(_escape_md_inline(md[last_idx:]))
 
-    return '\n\n'.join(result_parts)
+    return "\n\n".join(result_parts)
 
 
 async def deliver_response(update: Update, md_text: str):
@@ -136,7 +141,7 @@ async def deliver_response(update: Update, md_text: str):
         return
 
     # تقسيم بذكاء عند الفقرات (Markdown blocks)
-    blocks = md_text.split('\n\n')
+    blocks = md_text.split("\n\n")
     current_md = ""
 
     for block in blocks:
@@ -145,25 +150,29 @@ async def deliver_response(update: Update, md_text: str):
             continue
 
         if len(current_md) + len(block) + 2 <= MAX_MSG_LEN - 200:
-            current_md += block + '\n\n'
+            current_md += block + "\n\n"
         else:
             if current_md.strip():
-                await update.message.reply_text(md_to_tg_html(current_md.strip()), parse_mode="HTML")
+                await update.message.reply_text(
+                    md_to_tg_html(current_md.strip()), parse_mode="HTML"
+                )
                 await asyncio.sleep(0.3)
 
             # إذا كانت الكتلة وحيدة ضخمة جداً
             if len(block) > MAX_MSG_LEN:
-                buf = io.BytesIO(block.encode('utf-8'))
+                buf = io.BytesIO(block.encode("utf-8"))
                 buf.name = "response.txt"
                 await update.message.reply_document(
                     document=buf,
-                    caption="📄 الكتلة طويلة جداً — أرسلتها كملف نصي."
+                    caption="📄 الكتلة طويلة جداً — أرسلتها كملف نصي.",
                 )
             else:
-                current_md = block + '\n\n'
+                current_md = block + "\n\n"
 
     if current_md.strip():
-        await update.message.reply_text(md_to_tg_html(current_md.strip()), parse_mode="HTML")
+        await update.message.reply_text(
+            md_to_tg_html(current_md.strip()), parse_mode="HTML"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -484,21 +493,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text("❌ لم أجد حقل الكتابة في الموقع.")
                 return
 
+            # ── تثبيت/إعادة تعيين الـ interceptor ──
+            await page.evaluate(
+                """
+                () => {
+                    window.__lastChatSSE = null;
+                    window.__chatDone = false;
+
+                    if (window.__ccFetchHook) return;
+
+                    const orig = window.fetch;
+                    window.__ccFetchHook = true;
+
+                    window.fetch = async function(...args) {
+                        const response = await orig.apply(this, args);
+                        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+                        if (url.includes('/api/chat')) {
+                            try {
+                                window.__lastChatSSE = await response.clone().text();
+                            } catch(e) {}
+                            window.__chatDone = true;
+                        }
+                        return response;
+                    };
+                }
+                """
+            )
+
             await textarea.fill(text)
             await asyncio.sleep(0.3)
+            await textarea.press("Enter")
+            await status_msg.edit_text("⏳ تم الإرسال! بانتظار اكتمال الرد...")
 
-            # ── نستخدم expect_response (الأكثر موثوقية من wait_for_response) ──
-            async with page.expect_response(
-                lambda r: "/api/chat" in r.url and r.request.method == "POST",
+            # ── انتظر حتى ينتهي الـ SSE stream ──
+            await page.wait_for_function(
+                "window.__chatDone === true",
                 timeout=120000,
-            ) as response_info:
-                await textarea.press("Enter")
-                await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد من الخادم...")
+            )
 
-            response = await response_info.value
-            sse_text = await response.text()
+            # ── استخراج الـ SSE الخام ──
+            sse_text = await page.evaluate("() => window.__lastChatSSE || ''")
 
-            # تحليل Server-Sent Events
+            if not sse_text:
+                await status_msg.edit_text("❌ لم يُلتقط أي رد من الشبكة.")
+                return
+
+            # ── فكّك الـ SSE إلى Markdown ──
             response_md = ""
             for line in sse_text.splitlines():
                 line = line.strip()
@@ -523,6 +563,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.delete()
             except Exception:
                 pass
+
+            if not response_md.strip():
+                await update.message.reply_text("⚠️ الرد فارغ أو لم يُستخرج بشكل صحيح.")
+                return
 
             # ── تنسيق وإرسال الرد للمستخدم ──
             await deliver_response(update, response_md)
@@ -569,10 +613,12 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         page = await browser_ctx.new_page()
 
         # إخفاء automation
-        await page.add_init_script("""
+        await page.add_init_script(
+            """
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
             window.chrome = { runtime: {} };
-        """)
+            """
+        )
 
         # ━━ فتح الموقع ━━
         await snap(page, context, chat_id, "🌐 جاري فتح المتصفح...", first=True)
