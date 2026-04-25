@@ -3,6 +3,7 @@ import asyncio
 import logging
 import io
 import re
+import html
 from typing import Any, Dict, List, Optional
 
 from telegram import Update, InputMediaPhoto
@@ -54,7 +55,229 @@ async def post_init(app: Application) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Helpers (دوال مساعدة احترافية)
+#  تنظيف + تنسيق الردود
+# ═══════════════════════════════════════════════════════════════
+
+def clean_text(text: str) -> str:
+    """تنظيف UI lines مع الحفاظ على leading whitespace للكود"""
+    if not text:
+        return ""
+
+    ui_line_patterns = [
+        r'Enter(\s+to\s+send)?',
+        r'Shift\s*\+\s*Enter',
+        r'Ctrl[/\\]?Cmd\s*\+\s*V',
+        r'paste\s*attachment(\s*[·•])?',
+        r'attach\s*file?(\s*[·•])?',
+        r'to\s+send(\s*[·•])?',
+        r'for\s+new\s+line(\s*[·•])?',
+        r'record(\s*[·•])?',
+        r'Message\s*Grok',
+        r'Start\s+a\s+conversation',
+        r'Select\s+a\s+model',
+        r'Settings?',
+        r'^Gratisfy$',
+        r'Send\s*message',
+        r'Attach',
+        r'Paper\s*clip',
+        r'Mic(rophone)?',
+        r'new\s*line',
+        r'\d+\.?\d*\s*s(ec)?',
+        r'\d+\.?\d*\s*tok[/\\]s?',
+        r'\d+\s*tokens?',
+        r'Thinking',
+        r'Stop\s*generating',
+        r'Regenerate',
+        r'Copy',
+        r'Like',
+        r'Dislike',
+        r'Share',
+        r'Export',
+        r'Web\s*search',
+        r'Reason',
+    ]
+
+    lines = text.splitlines()
+    cleaned_lines: List[str] = []
+
+    for raw in lines:
+        # ❌ لا نستخدم .strip() العمياء!
+        # نحتفظ بالـ leading spaces (indentation) ونزيل trailing فقط
+        line = raw.rstrip()
+
+        stripped_for_check = line.strip()
+        if not stripped_for_check:
+            # نحتفظ بالأسطر الفارغة داخل الـ text لكنها ستُراجع لاحقاً
+            cleaned_lines.append(line)
+            continue
+
+        is_junk = False
+        for pat in ui_line_patterns:
+            if re.fullmatch(rf'\s*{pat}\s*', stripped_for_check, re.IGNORECASE):
+                is_junk = True
+                break
+
+        if is_junk:
+            continue
+
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
+
+def _looks_like_code_line(line: str) -> bool:
+    """يحدد ما إذا كان السطر جزءاً من كود برمجي"""
+    if not line:
+        return False
+
+    leading = len(line) - len(line.lstrip())
+    s = line.lstrip()
+
+    # indentation واضح (tab أو 4+ مسافات أو 2+ مع رموز برمجية)
+    if line.startswith('\t'):
+        return True
+    if leading >= 4:
+        return True
+    if leading >= 2 and any(ch in s for ch in '=[{()}:;.,|&+-*/%<>!'):
+        return True
+
+    # كلمات / أنماط مفتاحية
+    code_signatures = [
+        r'^import\s', r'^from\s+\S+\s+import', r'^def\s', r'^class\s',
+        r'^return\b', r'^if\b', r'^elif\b', r'^else\b', r'^for\b',
+        r'^while\b', r'^with\b', r'^try\b', r'^except\b', r'^finally\b',
+        r'^print\s*\(', r'^console\.', r'^const\b', r'^let\b', r'^var\b',
+        r'^function\b', r'^#\s', r'^//\s', r'^/\*', r'^\*/',
+        r'^echo\b', r'^<\?php', r'^<\?', r'^<html', r'^<div', r'^<span', r'^<script',
+        r'^npm\s', r'^yarn\s', r'^pip\s', r'^git\s', r'^curl\s',
+        r'^python\s', r'^node\s', r'^bash\s', r'^```',
+    ]
+
+    for sig in code_signatures:
+        if re.search(sig, s, re.IGNORECASE):
+            return True
+
+    return False
+
+
+def format_as_telegram_html(text: str) -> str:
+    """يحول النص إلى HTML مع تغليف الكود تلقائياً في <pre><code>"""
+    lines = text.splitlines()
+    out_segments: List[tuple[str, str]] = []  # (type, content)
+
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+
+        if _looks_like_code_line(line):
+            code_lines: List[str] = [line]
+            i += 1
+            while i < n:
+                nxt = lines[i]
+                if _looks_like_code_line(nxt):
+                    code_lines.append(nxt)
+                    i += 1
+                elif nxt.strip() == '':
+                    # سطر فارغ داخل الكود: استمر إذا كان السطر اللاحق كود أو فارغ أيضاً
+                    if i + 1 < n and (_looks_like_code_line(lines[i + 1]) or lines[i + 1].strip() == ''):
+                        code_lines.append(nxt)
+                        i += 1
+                    else:
+                        break
+                else:
+                    break
+
+            # إزالة الأسطر الفارغة من أطراف الكتلة فقط
+            while code_lines and code_lines[0].strip() == '':
+                code_lines.pop(0)
+            while code_lines and code_lines[-1].strip() == '':
+                code_lines.pop()
+
+            if code_lines:
+                body = html.escape('\n'.join(code_lines))
+                out_segments.append(('code', f'<pre><code>{body}</code></pre>'))
+        else:
+            if line.strip() == '':
+                out_segments.append(('text', ''))
+            else:
+                out_segments.append(('text', html.escape(line)))
+            i += 1
+
+    # دمج النص العادي المتتالي بـ <br>
+    final_parts: List[str] = []
+    text_buffer: List[str] = []
+
+    for seg_type, seg_content in out_segments:
+        if seg_type == 'code':
+            if text_buffer:
+                final_parts.append('<br>\n'.join(text_buffer))
+                text_buffer = []
+            final_parts.append(seg_content)
+        else:
+            text_buffer.append(seg_content)
+
+    if text_buffer:
+        final_parts.append('<br>\n'.join(text_buffer))
+
+    return '\n\n'.join(final_parts)
+
+
+async def deliver_response(update: Update, text: str):
+    """تنسيق الرد وإرساله للمستخدم (HTML قصير أو ملف طويل)"""
+    # 1. تنظيف نهائي قوي
+    cleaned = clean_text(text)
+    cleaned = re.sub(r'\n?\d+\.?\d*\s*s(?:ec)?\s*\n?', '\n', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\n?\d+\.?\d*\s*tok[/\\]?s?\s*\n?', '\n', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\n?\d+\s*tokens?\s*\n?', '\n', cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip('\n')
+
+    if not cleaned:
+        await update.message.reply_text("⚠️ لم أتمكن من استخراج رد نصي من الموقع.")
+        return
+
+    html_body = format_as_telegram_html(cleaned)
+
+    # إذا كان أقل من الحد، أرسله دفعة واحدة
+    if len(html_body) <= MAX_MSG_LEN:
+        await update.message.reply_text(html_body, parse_mode="HTML")
+        return
+
+    # تقسيم بذكاء عند الفقرات
+    blocks = cleaned.split('\n\n')
+    current_html = ""
+
+    for block in blocks:
+        if not block.strip():
+            continue
+
+        block_html = format_as_telegram_html(block)
+        if len(current_html) + len(block_html) + 2 <= MAX_MSG_LEN:
+            current_html += block_html + '\n\n'
+        else:
+            if current_html.strip():
+                await update.message.reply_text(current_html.strip(), parse_mode="HTML")
+                await asyncio.sleep(0.3)
+
+            # إذا كان block وحده ضخماً، أرسل كملف نصي ليحافظ على التنسيق
+            if len(block_html) > MAX_MSG_LEN:
+                buf = io.BytesIO(block.encode('utf-8'))
+                buf.name = "response.txt"
+                await update.message.reply_document(
+                    document=buf,
+                    caption="📄 الكتلة طويلة جداً — أرسلتها كملف نصي."
+                )
+                current_html = ""
+            else:
+                current_html = block_html + '\n\n'
+
+    if current_html.strip():
+        await update.message.reply_text(current_html.strip(), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Helpers الباقية
 # ═══════════════════════════════════════════════════════════════
 
 async def snap(
@@ -86,7 +309,6 @@ async def snap(
                 if chat_id in streams:
                     streams[chat_id]["message_id"] = sent.message_id
         else:
-            # نتجنب إرسال نفس الوسائط إذا لم تتغير كثيراً (يقلل من BadRequest)
             edit = io.BytesIO(screenshot)
             await context.bot.edit_message_media(
                 chat_id=chat_id,
@@ -98,103 +320,6 @@ async def snap(
             logger.warning(f"[snap] BadRequest: {e}")
     except Exception as e:
         logger.warning(f"[snap] Error: {e}")
-
-
-def clean_text(text: str) -> str:
-    """
-    تنظيف نهائي قوي لبقايا UI:
-    يزيل أسطر الأزرار والاختصارات والإحصائيات السفلية.
-    """
-    if not text:
-        return ""
-
-    # أنماط تطابق السطر بالكامل (مع مساحات بيضاء اختيارية)
-    ui_line_patterns = [
-        r'Enter\s*(to\s*send)?',
-        r'Shift\s*\+\s*Enter',
-        r'Ctrl[/\\]Cmd\s*\+\s*V',
-        r'paste\s*attachment',
-        r'attach\s*file?',
-        r'record',
-        r'Message\s*Grok',
-        r'Start\s*a\s*conversation',
-        r'Select\s*a\s*model',
-        r'Settings?',
-        r'Gratisfy',           # فقط إذا كان السطر منفرداً
-        r'Send\s*message',
-        r'Attach',
-        r'Paper\s*clip',
-        r'Mic(rophone)?',
-        r'new\s*line',
-        r'\d+\.?\d*\s*s(ec)?',        # 2.7s
-        r'\d+\.?\d*\s*tok[/\\]s?',
-        r'\d+\s*tokens?',
-        r'Thinking',
-        r'Stop\s*generating',
-        r'Regenerate',
-        r'Copy',
-        r'Like',
-        r'Dislike',
-        r'Share',
-        r'Export',
-        r'Web\s*search',
-        r'Reason',
-    ]
-
-    lines = text.splitlines()
-    cleaned: List[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        # إذا كان السطر يطابق نمط UI بالكامل، نتجاهله
-        is_junk = False
-        for pat in ui_line_patterns:
-            if re.fullmatch(rf'\s*{pat}\s*', stripped, re.IGNORECASE):
-                is_junk = True
-                break
-
-        if is_junk:
-            continue
-
-        # تجاهل الأسطر القصيرة جداً التي لا تحتوي على حروف (مثل "•" أو "⎘")
-        if len(stripped) < 3 and not any(c.isalpha() for c in stripped):
-            continue
-
-        cleaned.append(stripped)
-
-    return "\n".join(cleaned)
-
-
-async def send_long_text(update: Update, text: str):
-    """يقسّم النص الطويل بذكاء عند الفقرات/الأسطر دون كسر الجمل"""
-    if len(text) <= MAX_MSG_LEN:
-        await update.message.reply_text(text)
-        return
-
-    remaining = text
-    while remaining:
-        if len(remaining) <= MAX_MSG_LEN:
-            await update.message.reply_text(remaining)
-            break
-
-        # نبحث عن أفضل نقطة قص ضمن الحد
-        cut = remaining.rfind('\n\n', 0, MAX_MSG_LEN)
-        if cut == -1:
-            cut = remaining.rfind('\n', 0, MAX_MSG_LEN)
-        if cut == -1:
-            cut = remaining.rfind('. ', 0, MAX_MSG_LEN)
-        if cut <= 0:
-            cut = MAX_MSG_LEN
-
-        part = remaining[:cut].strip()
-        if part:
-            await update.message.reply_text(part)
-            await asyncio.sleep(0.4)  # راحة بسيطة لتجنب rate-limit
-
-        remaining = remaining[cut:].strip()
 
 
 async def is_login_visible(page) -> bool:
@@ -360,10 +485,7 @@ async def extract_response(
     pre_text: Optional[str] = None,
     timeout_sec: int = 120,
 ) -> str:
-    """
-    يستخرج رد البوت باستخدام الفرق بين innerText قبل وبعد الإرسال،
-    مع fallback على innerText العام إذا لم يكن pre_text متاحاً.
-    """
+    """يستخرج رد البوت باستخدام الفرق بين innerText قبل وبعد الإرسال"""
     start = asyncio.get_event_loop().time()
     last_text = ""
     stable = 0
@@ -375,17 +497,14 @@ async def extract_response(
                 let candidate = '';
 
                 if (pre && raw.length > pre.length && raw.startsWith(pre)) {
-                    // الاستراتيجية المثالية: أخذ الفرق فقط
                     candidate = raw.substring(pre.length);
                 } else {
-                    // Fallback: أخذ كل شيء بعد آخر ظهور لنص المستخدم
                     const idx = raw.lastIndexOf(user);
                     if (idx !== -1) {
                         candidate = raw.substring(idx + user.length);
                     }
                 }
 
-                // إزالة نص المستخدم نفسه إذا تبقى في بداية الفرق
                 if (candidate.startsWith(user)) {
                     candidate = candidate.substring(user.length);
                 }
@@ -396,12 +515,10 @@ async def extract_response(
         )
 
         current = (js_result or "").strip()
-        current = clean_text(current)
 
         if current:
             if current == last_text:
                 stable += 1
-                # استقرار لـ ~3 ثوانٍ (sleep 1.5 × 2)
                 if stable >= 2:
                     return current
             else:
@@ -410,7 +527,7 @@ async def extract_response(
 
         await asyncio.sleep(1.5)
 
-    return clean_text(last_text)
+    return last_text
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -475,7 +592,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يستقبل الرسائل أثناء البث النشط ويرد بالنص"""
+    """يستقبل الرسائل أثناء البث النشط ويرد بالنص المنسّق"""
     chat_id = update.effective_chat.id
     text = update.message.text
 
@@ -522,7 +639,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد...")
 
-            # ── استخراج الرد باستخدام الفرق (أدق بكثير) ──
+            # ── استخراج الرد ──
             response = await extract_response(
                 page, text, pre_text=pre_inner, timeout_sec=120
             )
@@ -532,14 +649,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            if not response:
-                await update.message.reply_text(
-                    "⚠️ لم أتمكن من استخراج رد نصي من الموقع."
-                )
-                return
-
-            # ── إرسال النظيف للمستخدم ──
-            await send_long_text(update, response)
+            # ── تنسيق وإرسال الرد للمستخدم ──
+            await deliver_response(update, response)
 
         except Exception as e:
             logger.exception("[handle_message] Error")
