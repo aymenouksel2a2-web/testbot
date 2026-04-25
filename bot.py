@@ -450,6 +450,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             status_msg = await update.message.reply_text("⏳ جاري إرسال السؤال...")
 
+            # ── إغلاق أي popup قد تظهر (Discord / Close) ──
+            for sel in [
+                "button:has-text('NOT NOW')",
+                "button:has-text('Close')",
+                "[aria-label='Close']",
+                "button.close",
+            ]:
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=1500):
+                        await loc.click()
+                        await page.wait_for_timeout(400)
+                except Exception:
+                    pass
+
             # ── إيجاد حقل الإدخال ──
             textarea = None
             for sel in [
@@ -472,19 +487,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await textarea.fill(text)
             await asyncio.sleep(0.3)
 
-            # ── نبدأ الاستماع على الشبكة قبل الضغط Enter ──
-            response_promise = asyncio.create_task(
-                page.wait_for_response(
-                    lambda r: "/api/chat" in r.url and r.request.method == "POST",
-                    timeout=120000,
-                )
-            )
+            # ── نستخدم expect_response (الأكثر موثوقية من wait_for_response) ──
+            async with page.expect_response(
+                lambda r: "/api/chat" in r.url and r.request.method == "POST",
+                timeout=120000,
+            ) as response_info:
+                await textarea.press("Enter")
+                await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد من الخادم...")
 
-            await textarea.press("Enter")
-            await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد من الخادم...")
-
-            # ── انتظر الـ Response ثم اقرأ الـ SSE كاملاً ──
-            response = await response_promise
+            response = await response_info.value
             sse_text = await response.text()
 
             # تحليل Server-Sent Events
@@ -569,8 +580,13 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         await snap(page, context, chat_id, "🌐 تم الوصول إلى الموقع")
         await asyncio.sleep(1.5)
 
-        # إغلاق Popups
-        for sel in ["button:has-text('Close')", "[aria-label='Close']", "button.close"]:
+        # إغلاق Popups (بما فيها Discord "NOT NOW")
+        for sel in [
+            "button:has-text('NOT NOW')",
+            "button:has-text('Close')",
+            "[aria-label='Close']",
+            "button.close",
+        ]:
             try:
                 loc = page.locator(sel).first
                 if await loc.is_visible(timeout=1500):
