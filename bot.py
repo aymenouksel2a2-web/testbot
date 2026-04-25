@@ -39,7 +39,7 @@ TARGET_MODEL = os.environ.get("TARGET_MODEL", "Grok Uncensored")
 
 STREAM_INTERVAL = 3
 PERSISTENT_DIR = "/tmp/gratisfy-data"
-MAX_MSG_LEN = 4000  # Telegram text limit safety margin
+MAX_MSG_LEN = 4000
 
 # ═══════════════════════════════════════════════════════════════
 #  بنية البيانات
@@ -69,7 +69,6 @@ def _html_esc(s: str) -> str:
 
 
 def _escape_md_inline(text: str) -> str:
-    """يحول **bold** __italic__ ~~strike~~ و inline `code` داخل نص عادي"""
     placeholders: List[str] = []
 
     def store_tag(m, tag_name):
@@ -82,7 +81,6 @@ def _escape_md_inline(text: str) -> str:
     text = re.sub(r"__(.+?)__", lambda m: store_tag(m, "i"), text)
     text = re.sub(r"~~(.+?)~~", lambda m: store_tag(m, "s"), text)
 
-    # inline code
     parts = []
     pos = 0
     for m in re.finditer(r"`([^`]+)`", text):
@@ -95,22 +93,22 @@ def _escape_md_inline(text: str) -> str:
     else:
         parts.append("")
 
-    return "".join(parts)
+    result = "".join(parts)
+    for i, ph in enumerate(placeholders):
+        result = result.replace(f"\x00{i}\x00", ph)
+    return result
 
 
 def _escape_md_plain(text: str) -> str:
-    """يهرب HTML ويحول \\n إلى <br>"""
     text = _html_esc(text)
     text = text.replace("\n", "<br>")
     return text
 
 
 def md_to_tg_html(md: str) -> str:
-    """يحوّل Markdown (fenced blocks + inline) إلى Telegram HTML"""
     result_parts: List[str] = []
     last_idx = 0
 
-    # fenced code blocks: ```lang\ncode\n```
     for m in re.finditer(r"```([^\n]*)\n(.*?)\n?```", md, re.DOTALL):
         start, end = m.span()
         if start > last_idx:
@@ -118,7 +116,6 @@ def md_to_tg_html(md: str) -> str:
 
         code = m.group(2)
         code_escaped = _html_esc(code)
-        # Telegram <pre> alone makes monospace block
         result_parts.append(f"<pre><code>{code_escaped}</code></pre>")
         last_idx = end
 
@@ -129,7 +126,6 @@ def md_to_tg_html(md: str) -> str:
 
 
 async def deliver_response(update: Update, md_text: str):
-    """يُنسّق Markdown ويُرسله للمستخدم (HTML)"""
     if not md_text or not md_text.strip():
         await update.message.reply_text("⚠️ لم أتمكن من استخراج رد نصي من الموقع.")
         return
@@ -140,7 +136,6 @@ async def deliver_response(update: Update, md_text: str):
         await update.message.reply_text(md_to_tg_html(md_text), parse_mode="HTML")
         return
 
-    # تقسيم بذكاء عند الفقرات (Markdown blocks)
     blocks = md_text.split("\n\n")
     current_md = ""
 
@@ -158,7 +153,6 @@ async def deliver_response(update: Update, md_text: str):
                 )
                 await asyncio.sleep(0.3)
 
-            # إذا كانت الكتلة وحيدة ضخمة جداً
             if len(block) > MAX_MSG_LEN:
                 buf = io.BytesIO(block.encode("utf-8"))
                 buf.name = "response.txt"
@@ -176,7 +170,7 @@ async def deliver_response(update: Update, md_text: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Helpers الباقية
+#  Helpers
 # ═══════════════════════════════════════════════════════════════
 
 async def snap(
@@ -186,7 +180,6 @@ async def snap(
     caption: str,
     first: bool = False,
 ):
-    """يلتقط لقطة شاشة ويُحدّث الرسالة المصوّرة في نفس الرسالة"""
     try:
         screenshot = await page.screenshot(type="jpeg", quality=55)
         photo = io.BytesIO(screenshot)
@@ -222,7 +215,6 @@ async def snap(
 
 
 async def is_login_visible(page) -> bool:
-    """يتحقق هل زر Log in ظاهر في الصفحة حالياً"""
     selectors = [
         'button:has-text("Log in")',
         'a:has-text("Log in")',
@@ -241,7 +233,6 @@ async def is_login_visible(page) -> bool:
 
 
 async def perform_login(page):
-    """ينفّذ تسجيل الدخول كاملاً (يفترض أن الزر ظاهر)"""
     login_btn = page.locator(
         'button:has-text("Log in"), a:has-text("Log in")'
     ).first
@@ -249,7 +240,6 @@ async def perform_login(page):
     await login_btn.click()
     await asyncio.sleep(2.5)
 
-    # ── إدخال البريد ──
     email_in = None
     for sel in [
         'input[name="email"]',
@@ -269,7 +259,6 @@ async def perform_login(page):
     await email_in.fill(LOGIN_EMAIL)
     await asyncio.sleep(0.4)
 
-    # ── إدخال كلمة المرور ──
     pass_in = None
     for sel in [
         'input[name="password"]',
@@ -289,11 +278,9 @@ async def perform_login(page):
     await pass_in.fill(LOGIN_PASSWORD)
     await asyncio.sleep(0.4)
 
-    # ── إرسال ──
     await pass_in.press("Enter")
     await asyncio.sleep(1.0)
 
-    # Fallback submit buttons
     for btn_text in ["Submit", "Sign in", "Login", "Continue"]:
         try:
             btn = page.locator(f'button:has-text("{btn_text}")').last
@@ -307,7 +294,6 @@ async def perform_login(page):
 
 
 async def select_model(page, model_name: str) -> bool:
-    """يختار النموذج من القائمة المنسدلة"""
     trigger = None
     for sel in [
         '[data-testid="model-selector"]',
@@ -334,7 +320,6 @@ async def select_model(page, model_name: str) -> bool:
     await trigger.click()
     await asyncio.sleep(1.5)
 
-    # حقل البحث
     search_in = None
     for sel in [
         'input[placeholder*="Search" i]',
@@ -354,7 +339,6 @@ async def select_model(page, model_name: str) -> bool:
     await search_in.fill(model_name)
     await asyncio.sleep(1.0)
 
-    # اختيار النتيجة
     result = None
     for sel in [
         f"text={model_name}",
@@ -440,7 +424,7 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يستقبل الرسائل أثناء البث النشط ويرد بالنص المنسّق"""
+    """الحل الخارق: Playwright native network capture"""
     chat_id = update.effective_chat.id
     text = update.message.text
 
@@ -459,20 +443,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             status_msg = await update.message.reply_text("⏳ جاري إرسال السؤال...")
 
-            # ── إغلاق أي popup قد تظهر (Discord / Close) ──
-            for sel in [
-                "button:has-text('NOT NOW')",
-                "button:has-text('Close')",
-                "[aria-label='Close']",
-                "button.close",
-            ]:
-                try:
-                    loc = page.locator(sel).first
-                    if await loc.is_visible(timeout=1500):
-                        await loc.click()
-                        await page.wait_for_timeout(400)
-                except Exception:
-                    pass
+            # ── إغلاق أي popup بقوة ──
+            try:
+                await page.evaluate(
+                    """
+                    () => {
+                        document.querySelectorAll('button').forEach(b => {
+                            const t = b.textContent.trim().toUpperCase();
+                            const a = (b.getAttribute('aria-label') || '').toUpperCase();
+                            if (t === 'NOT NOW' || t === 'CLOSE' || a === 'CLOSE') b.click();
+                        });
+                    }
+                """
+                )
+            except Exception:
+                pass
 
             # ── إيجاد حقل الإدخال ──
             textarea = None
@@ -493,54 +478,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status_msg.edit_text("❌ لم أجد حقل الكتابة في الموقع.")
                 return
 
-            # ── تثبيت/إعادة تعيين الـ interceptor ──
-            await page.evaluate(
-                """
-                () => {
-                    window.__lastChatSSE = null;
-                    window.__chatDone = false;
+            # ═══════════════════════════════════════════════════════
+            #  الحل الخارق: التقاط الـ Network Response الأصلي
+            # ═══════════════════════════════════════════════════════
+            sse_text = [""]           # حاوية للنص الخام
+            got_response = asyncio.Event()
+            capture_active = [True]
 
-                    if (window.__ccFetchHook) return;
+            async def on_response(response):
+                if not capture_active[0]:
+                    return
+                if "/api/chat" in response.url and response.request.method == "POST":
+                    try:
+                        # text/event-stream: Playwright يجمع كل chunks تلقائياً
+                        body = await response.text()
+                        sse_text[0] = body
+                        capture_active[0] = False
+                        got_response.set()
+                    except Exception as e:
+                        logger.warning(f"[on_response] body error: {e}")
 
-                    const orig = window.fetch;
-                    window.__ccFetchHook = true;
-
-                    window.fetch = async function(...args) {
-                        const response = await orig.apply(this, args);
-                        const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-                        if (url.includes('/api/chat')) {
-                            try {
-                                window.__lastChatSSE = await response.clone().text();
-                            } catch(e) {}
-                            window.__chatDone = true;
-                        }
-                        return response;
-                    };
-                }
-                """
-            )
+            page.on("response", on_response)
 
             await textarea.fill(text)
             await asyncio.sleep(0.3)
             await textarea.press("Enter")
-            await status_msg.edit_text("⏳ تم الإرسال! بانتظار اكتمال الرد...")
+            await status_msg.edit_text("⏳ تم الإرسال! بانتظار الرد من الخادم...")
 
-            # ── انتظر حتى ينتهي الـ SSE stream ──
-            await page.wait_for_function(
-                "window.__chatDone === true",
-                timeout=120000,
-            )
-
-            # ── استخراج الـ SSE الخام ──
-            sse_text = await page.evaluate("() => window.__lastChatSSE || ''")
-
-            if not sse_text:
-                await status_msg.edit_text("❌ لم يُلتقط أي رد من الشبكة.")
+            # ── انتظر انتهاء الـ Stream ──
+            try:
+                await asyncio.wait_for(got_response.wait(), timeout=120.0)
+            except asyncio.TimeoutError:
+                capture_active[0] = False
+                await status_msg.edit_text("⏰ انتهى الوقت دون استلام رد من الخادم.")
                 return
 
-            # ── فكّك الـ SSE إلى Markdown ──
+            capture_active[0] = False
+
+            raw_sse = sse_text[0]
+            if not raw_sse:
+                await status_msg.edit_text("❌ الرد فارغ من الشبكة.")
+                return
+
+            # ── فكّك SSE إلى Markdown ──
             response_md = ""
-            for line in sse_text.splitlines():
+            for line in raw_sse.splitlines():
                 line = line.strip()
                 if not line.startswith("data: "):
                     continue
@@ -568,7 +550,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ الرد فارغ أو لم يُستخرج بشكل صحيح.")
                 return
 
-            # ── تنسيق وإرسال الرد للمستخدم ──
+            # ── أرسل للمستخدم ──
             await deliver_response(update, response_md)
 
         except Exception as e:
@@ -583,7 +565,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Stream Worker (المحرك الرئيسي)
+#  Stream Worker
 # ═══════════════════════════════════════════════════════════════
 
 async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -612,12 +594,11 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
         page = await browser_ctx.new_page()
 
-        # إخفاء automation
         await page.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => false });
             window.chrome = { runtime: {} };
-            """
+        """
         )
 
         # ━━ فتح الموقع ━━
@@ -626,20 +607,21 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         await snap(page, context, chat_id, "🌐 تم الوصول إلى الموقع")
         await asyncio.sleep(1.5)
 
-        # إغلاق Popups (بما فيها Discord "NOT NOW")
-        for sel in [
-            "button:has-text('NOT NOW')",
-            "button:has-text('Close')",
-            "[aria-label='Close']",
-            "button.close",
-        ]:
-            try:
-                loc = page.locator(sel).first
-                if await loc.is_visible(timeout=1500):
-                    await loc.click()
-                    await page.wait_for_timeout(400)
-            except Exception:
-                pass
+        # إغلاق Popups (Discord + Close)
+        try:
+            await page.evaluate(
+                """
+                () => {
+                    document.querySelectorAll('button').forEach(b => {
+                        const t = b.textContent.trim().toUpperCase();
+                        const a = (b.getAttribute('aria-label') || '').toUpperCase();
+                        if (t === 'NOT NOW' || t === 'CLOSE' || a === 'CLOSE') b.click();
+                    });
+                }
+            """
+            )
+        except Exception:
+            pass
 
         # ━━ تسجيل الدخول الذكي ━━
         if LOGIN_EMAIL and LOGIN_PASSWORD:
@@ -661,7 +643,6 @@ async def stream_worker(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await snap(page, context, chat_id, "✅ الجلسة محفوظة (مسجل مسبقاً)")
 
-            # تحقق نهائي في /chat
             await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2)
 
